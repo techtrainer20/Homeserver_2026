@@ -1,0 +1,14 @@
+[Unit]
+Description=File Browser Web File Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/filebrowser -r /home/shared --address 0.0.0.0 --port 8080 --database /home/shared/filebrowser.db
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

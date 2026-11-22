@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Home Server Wall Dashboard
+Comment=Auto-start fullscreen dashboard on X11 login
+Exec=/bin/bash -lc "$HOME/start_dashboard.sh"
+Terminal=false
+X-GNOME-Autostart-enabled=true

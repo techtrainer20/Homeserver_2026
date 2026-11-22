@@ -1,0 +1,28 @@
+# Example Samba configuration (/etc/samba/smb.conf)
+# Exposes /home/shared on LAN with a built-in .recycle trash bin
+
+[global]
+   workgroup = WORKGROUP
+   server string = Home Server Samba
+   netbios name = HOMESERVER
+   security = user
+   map to guest = Bad User
+   dns proxy = no
+   server role = standalone server
+
+[shared]
+   comment = Home Server Shared Storage
+   path = /home/shared
+   browseable = yes
+   writable = yes
+   guest ok = yes
+   read only = no
+   create mask = 0775
+   directory mask = 0775
+
+   vfs objects = recycle
+   recycle:repository = .recycle
+   recycle:keeptree = yes
+   recycle:versions = yes
+   recycle:touch = yes
+   recycle:exclude = *.tmp, *.temp, ~$*

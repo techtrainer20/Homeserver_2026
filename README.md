@@ -1,10 +1,16 @@
-# Home Server Wall Dashboard & Hardened Telegram Automation Suite (`vickyhome`)
+# All-in-One Low-RAM Home Server Suite (`homeserver_2026`)
 
-Turn an old **1 GB RAM / 32-bit laptop** (like a Lenovo IdeaPad S10e running Debian) or a **Raspberry Pi** into an always-on smart wall dashboard, local ADS-B flight radar, ISS/space sky dome, file-server photo frame, on-demand OpenCV USB security camera, and hardened 2-way Telegram ops bot.
+Turn an old **1 GB RAM / 32-bit laptop** (like a Lenovo IdeaPad S10e running Debian) or a **Raspberry Pi** into a complete, self-hosted home server & smart wall display:
+
+- **Network-Wide Ad Blocker** (AdGuard Home DNS)
+- **Private Cloud & LAN File Server** (FileBrowser + Copyparty + Samba SMB with Recycle Bin + Safe USB Auto-Mount)
+- **Zero-Config Remote Access** (Tailscale VPN + UFW Firewall + Cockpit Admin HUD)
+- **7-Slide Fullscreen Wall Dashboard** (Clock, Weather, System/AdGuard Stats, All-Sky ISS Dome & ISRO Launches, 10 km Auto-Popup Flight Radar, and File-Server Photo Frame)
+- **Hardened 2-Way Telegram Ops Bot** (On-demand OpenCV USB Security Camera with JPEG + 8s MP4 alerts, Daily Briefings, Overhead Flight Alerts, ISS Alerts, Gemini AI, and Real-Time SSH/`sudo` Intrusion Alerts)
 
 ---
 
-## Live Screenshots (`1024x576` Wall Display)
+## Live Wall Dashboard Screenshots (`1024x576`)
 
 | Main Dashboard (Clock, Weather, Events & Online Photos) | Full-Screen All-Sky ISS Dome & ISRO Manifest |
 | :---: | :---: |
@@ -16,53 +22,56 @@ Turn an old **1 GB RAM / 32-bit laptop** (like a Lenovo IdeaPad S10e running Deb
 
 ---
 
-## Key Features
+## Complete Server Stack & Port Map
 
-### 1. Seven-Slide Fullscreen Wall Dashboard (`dashboard/newdash25.py`)
-Built in pure Python (`tkinter` + `Pillow`) with zero Electron/browser bloat so it runs smoothly inside ~1 GB RAM:
-- **Page 0 — Main:** Clock (`12h`/`24h`), live weather + animated icon, upcoming festival/custom reminders, and an online Bing/Picsum photo panel.
-- **Page 1 — Weather Detail:** 12-hour temperature & precipitation chart plus sunrise/sunset and moon phase.
-- **Page 2 — System Health:** CPU/RAM sparklines, disk space, LAN/Internet ping, Tailscale status, Docker container count, and live **AdGuard Home** ad-block metrics.
-- **Page 3 — Money & Quotes:** Live currency/gold-silver widget & daily quote card.
-- **Page 4 — All-Sky ISS Dome & Space:** Stereographic sky dome centered on your GPS coordinates with animated visible ISS pass arcs (`max elevation >= 25°`), real-time ISS telemetry, sun/moon almanac, and upcoming ISRO launches from Sriharikota (`42° NE` azimuth beacon).
-- **Page 5 — 10 km Overhead Flight Radar (Auto-Popup):** Dark CartoDB map tiles with `5 km` and `10 km` radar rings. Whenever any aircraft enters the `10 km` radius (via `adsb.fi` / `OpenSky` + `adsbdb` routes), the display **automatically switches full-screen** to track its route arc, altitude, heading, and progress bar, then returns to the previous slide once clear.
-- **Page 6 — Server Photos Gallery:** Recursively scans your file-server folder (`~/slides_local` -> `/home/shared/dashboard_photos`) for `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, and `.gif` files, applies EXIF auto-rotation, and frames both portrait and landscape photos cleanly over a fast ambient blurred backdrop with zero cropping.
-- **Bottom Breaking News Ticker & Phone Control Web UI:** Smooth multi-feed RSS news bar with keyword hide/highlight filters, plus a lightweight LAN web remote (`http://<server-ip>:8765/?token=...`) to switch pages, skip photos, push banners, start countdown timers, or dim brightness.
-
-### 2. Hardened 2-Way Telegram Bot & USB Security Camera (`telegram-bot/vickyhome-telegram-bot.py`)
-Runs as an unprivileged `vickybot` user inside a strict `systemd` sandbox (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `DevicePolicy=closed`, strict owner-only private chat verification):
-- **On-Demand USB Webcam Security Mode (0% Idle CPU):**
-  - Inactive by default on boot (camera closed, LED off).
-  - Send `security` or `/security_on` when leaving home -> opens the secondary USB webcam (`ffmpeg` V4L2 -> `OpenCV` `MOG2` background subtraction + conditional `HOG` person detection).
-  - On motion/person detection: immediately sends an **annotated JPEG snapshot** (with green `PERSON` / amber `MOTION` boxes + timestamp), records an **~8-second H.264 MP4 clip** (including ~1.8s pre-motion buffer), sends it via Telegram `sendVideo`, enforces a `45s` cooldown, and logs every event with timestamp to `/var/lib/vickyhome-tgbot/security_events.log`.
-  - Send `/security_off` when returning home to immediately stop monitoring and release the webcam.
-  - Supports **dual cameras** independently via persistent `/dev/v4l/by-id/` symlinks (`/snapshot` for the external USB security webcam, `/snap` for a built-in laptop camera).
-- **Real-Time Alerts & Scheduled Reports:**
-  - Instant overhead flight alerts (`<= 10 km`) and a **9:00 PM daily flight recap** highlighting low-altitude passes (`< 10,000 ft`), private jets, and helicopters (`vickyhome-flight-recap.timer`).
-  - **7:30 AM daily morning briefing** with local weather, sunrise/sunset, moon phase, server health, and AdGuard stats (`vickyhome-briefing.timer`).
-  - Upcoming visible **ISS pass** & **ISRO launch** alerts.
-  - Optional built-in **Gemini AI** chat assistant (`/ai` or plain text).
-
-### 3. Real-Time SSH & `sudo` Intrusion Monitor (`telegram-bot/vickyhome-auth-alert.py`)
-Tails `/var/log/auth.log` and sends instant Telegram / `ntfy.sh` push alerts on SSH logins, failed SSH brute-force probes (classified as Home LAN / Tailscale VPN / External Internet), and `sudo` root commands.
+| Service | Port / Protocol | Purpose |
+| :--- | :---: | :--- |
+| **AdGuard Home** | `53/udp,tcp` & `:8081` (`:3000` setup) | Network-wide DNS ad & tracker blocking for every phone/TV on your Wi-Fi |
+| **FileBrowser** | `:8080` | Clean web file manager over `/home/shared` (upload wall photos to `dashboard_photos`) |
+| **Copyparty** | `:3923` | Ultra-fast drag-and-drop file upload, resumable transfers & `/shr` share links |
+| **Samba (SMB)** | `445/tcp` | Native Windows/macOS/Android LAN drive (`\\<server-ip>\shared`) with `.recycle` trash |
+| **Wall Dashboard & Remote** | X11 + `:8765` | 7-slide fullscreen Tkinter display + mobile browser control panel |
+| **Cockpit Server HUD** | `:9090` (HTTPS) | Browser-based Linux system monitor, terminal & service manager |
+| **Tailscale VPN** | `tailscale0` | Encrypted remote access to all services from anywhere without router port-forwarding |
+| **Telegram Ops & Security Bot** | Outbound HTTPS | 2-way owner-only Telegram bot + on-demand OpenCV USB security camera |
+| **SSH & `sudo` Auth Alert** | Outbound HTTPS | Instant phone push alerts (Telegram / `ntfy.sh`) on SSH logins, brute-force & `sudo` |
+| **Safe USB Auto-Mount** | `udev` | Plug in any formatted USB flash drive -> auto-mounts into `/home/shared/USB-Drive` |
 
 ---
 
-## Architecture Overview
+## Full-Stack Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
+    subgraph Network["Network, Security & Remote Access"]
+        AGH["AdGuard Home<br/>DNS :53 / UI :8081"]
+        TS["Tailscale VPN (tailscale0)"]
+        UFW["UFW Firewall"]
+        COCKPIT["Cockpit HUD (:9090)"]
+    end
+
+    subgraph Storage["Private Cloud & Shared Storage (/home/shared)"]
+        FB["FileBrowser (:8080)"]
+        CP["Copyparty (:3923)"]
+        SMB["Samba SMB + Recycle Bin"]
+        USB["Safe USB Auto-Mount<br/>/media/usbdrive -> USB-Drive"]
+        PHOTOS["/home/shared/dashboard_photos"]
+        FB --- PHOTOS
+        CP --- PHOTOS
+        SMB --- PHOTOS
+        USB --- FB
+    end
+
     subgraph Display["Wall Display (X11 1024x576)"]
-        DASH["newdash25.py<br/>7 Full-Screen Slides + News Bar"]
+        DASH["newdash25.py<br/>7 Slides + News Bar"]
         HTTP["Phone Remote API (:8765)"]
         DASH --- HTTP
     end
 
-    subgraph Storage["Local File Servers (/home/shared)"]
-        FS["FileBrowser (:8080) / Copyparty (:3923) / Samba"]
-        DIR["/home/shared/dashboard_photos"]
-        FS --> DIR
-        DIR -->|symlink ~/slides_local| DASH
+    subgraph Bot["Hardened systemd Services (vickybot)"]
+        TGBOT["vickyhome-telegram-bot.py<br/>OpenCV Security Cam + Alerts + AI"]
+        TIMERS["systemd Timers<br/>07:30 Briefing / 21:00 Flight Recap"]
+        AUTH["vickyhome-auth-alert.py<br/>/var/log/auth.log Monitor"]
     end
 
     subgraph Cameras["Dual USB Webcams (/dev/v4l/by-id)"]
@@ -70,15 +79,12 @@ flowchart LR
         CAM2["Built-in Webcam (/dev/video2)"]
     end
 
-    subgraph Bot["Hardened systemd Services (vickybot)"]
-        TGBOT["vickyhome-telegram-bot.py<br/>OpenCV MOG2+HOG + Alerts + Gemini AI"]
-        TIMERS["systemd Timers<br/>07:30 Briefing / 21:00 Flight Recap"]
-        AUTH["vickyhome-auth-alert.py<br/>/var/log/auth.log Monitor"]
-    end
-
+    PHOTOS -->|symlink ~/slides_local| DASH
+    AGH -->|Stats API| DASH
+    AGH -->|Stats API| TGBOT
     CAM1 -->|On-demand /security_on & /snapshot| TGBOT
     CAM2 -->|On-demand /snap| TGBOT
-    HTTP -->|Local Flight Cache| TGBOT
+    HTTP -->|10 km Flight Cache| TGBOT
     TGBOT -->|JPEG / MP4 / Alerts| TG["Telegram Owner Chat"]
     TIMERS --> TGBOT
     AUTH -->|SSH & sudo Alerts| TG
@@ -86,117 +92,124 @@ flowchart LR
 
 ---
 
-## Telegram Commands
+## One-Command Full Installation (Debian / Ubuntu / Raspberry Pi OS)
 
-| Command / Message | Description |
+Clone the repository onto your server and run the interactive installer (`install.sh` lets you pick **every** component or skip any you don't need — pass `--all` to install everything automatically):
+
+```bash
+git clone https://github.com/techtrainer20/homeserver_2026.git
+cd homeserver_2026
+sudo bash install.sh
+```
+
+After `install.sh` completes, finish these 4 quick personalization steps:
+
+1. **AdGuard Home Ad-Blocker Setup (`:3000` -> `:8081`):**
+   - Open `http://<server-ip>:3000` in your browser.
+   - Set **Admin Web Interface** port to `8081` (so FileBrowser keeps `8080`) and **DNS Server** port to `53`.
+   - Point your home Wi-Fi router's Primary DNS to `<server-ip>` to block ads across all phones, TVs, and laptops automatically.
+2. **Dashboard Settings (`~/dashboard_config.json`):**
+   - Set your `location_name`, `latitude`, `longitude`, `phone_control.token`, and `adguard` credentials.
+   - Upload photos (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.gif`) into `/home/shared/dashboard_photos` via FileBrowser (`:8080`), Copyparty (`:3923`), or Samba (`\\<server-ip>\shared`) — they appear automatically on **Page 6 (`Server Photos`)**!
+3. **Telegram Bot & Auth Alerts (`/etc/vickyhome-tgbot.conf` & `/etc/vickyhome-alerts.conf`):**
+   - Create a bot via `@BotFather` and get your numeric Telegram user ID via `@userinfobot`.
+   - Fill in `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and optionally `GEMINI_API_KEY` and `ADGUARD_PASS`, then start the services:
+     ```bash
+     sudo systemctl start \
+       vickyhome-telegram-bot.service \
+       vickyhome-auth-alert.service \
+       vickyhome-briefing.timer \
+       vickyhome-flight-recap.timer
+     ```
+4. **Tailscale Remote Access:**
+   - Run `sudo tailscale up` and sign in on both your server and phone to access FileBrowser, Copyparty, AdGuard Home, Cockpit, and the Dashboard Phone Remote securely from anywhere in the world.
+
+---
+
+## Feature Highlights
+
+### 7-Slide Fullscreen Wall Dashboard (`dashboard/newdash25.py`)
+Engineered in pure Python (`tkinter` + `Pillow`) with zero browser/Electron overhead (~1 GB RAM friendly):
+- **Page 0 — Main:** Clock (`12h`/`24h`), live weather + animated icon, upcoming reminders, and online Bing/Picsum photos.
+- **Page 1 — Weather Detail:** 12-hour forecast & rain-chance chart, sunrise/sunset, and moon phase.
+- **Page 2 — System Health:** CPU/RAM sparklines, disk space, router/internet ping, Tailscale status, Docker count, and live **AdGuard Home** blocked queries.
+- **Page 3 — Money & Quotes:** Currency/metals widget & daily quote card.
+- **Page 4 — All-Sky ISS Dome & Space:** Stereographic sky dome with animated visible ISS pass arcs (`max elevation >= 25°`), real-time ISS telemetry, sun/moon almanac, and upcoming ISRO launches (`42° NE` beacon).
+- **Page 5 — 10 km Flight Radar (Auto-Popup):** Dark CartoDB map tiles with `5 km` / `10 km` rings. Automatically switches full-screen whenever an aircraft enters `10 km` (`adsb.fi`/`OpenSky` + `adsbdb` routes) and restores the previous slide once clear.
+- **Page 6 — Server Photos Gallery:** Recursively displays uploaded photos from `/home/shared/dashboard_photos` with EXIF rotation and an ambient blurred backdrop (zero portrait cropping).
+
+### Hardened Telegram Bot & On-Demand OpenCV USB Security Camera (`telegram-bot/vickyhome-telegram-bot.py`)
+Runs as unprivileged user `vickybot` inside a strict `systemd` sandbox (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `DevicePolicy=closed`, strict private-chat owner-only guard):
+- **Inactive by Default (0% Idle CPU):** USB webcam stays closed until you send `security` or `/security_on`.
+- **Motion + Person Detection:** Streams `640x480` V4L2 frames via `ffmpeg` into OpenCV `MOG2` background subtraction + conditional `HOG` person detection (`0.06s`/check).
+- **Instant Photo + 8s Video Clip:** Immediately sends an annotated JPEG (`PERSON` / `MOTION` bounding boxes + timestamp) and an ~8-second H.264 MP4 clip (including ~1.8s pre-motion buffer) with a `45s` anti-spam cooldown and persistent timestamped log (`/var/lib/vickyhome-tgbot/security_events.log`).
+- **Dual Camera Support:** External USB webcam handles `/security_on` & `/snapshot`; built-in laptop webcam stays separate for `/snap` (using persistent `/dev/v4l/by-id/` symlinks).
+- **Generic USB Webcam Fix (`udev/99-usb-webcam-power.rules`):** Prevents cheap UVC webcams from hitting kernel `-75`/`-32` (`Input/output error`) after USB autosuspend.
+
+---
+
+## Telegram Commands & Dashboard Shortcuts
+
+| Telegram Command | Action |
 | :--- | :--- |
 | `/security_on` or `security` | Arm USB webcam motion & person security monitoring |
-| `/security_off` or `security off` | Disarm monitoring and release webcam (0% idle CPU) |
-| `/security_status` | Show armed state, cooldown, camera path & recent detection log |
-| `/snapshot` | Capture and send an instant photo from the external USB security webcam |
-| `/snap` (`/cam`, `/photo`) | Capture an on-demand photo from the built-in camera |
-| `/flights` | Live aircraft currently within 10 km |
-| `/recap` | Today's 10 km overhead flight recap & interesting sightings |
-| `/sky` (`/iss`, `/launches`) | Sun/Moon almanac, live ISS distance, next visible passes & ISRO launches |
-| `/briefing` | Weather, server health, and AdGuard Home summary |
-| `/status`, `/temp`, `/ram`, `/disk`, `/top`, `/services`, `/adguard` | On-demand server diagnostics |
-| `/ai <question>` or plain text | Ask Gemini AI (with `/clear` to reset short-term history) |
+| `/security_off` or `security off` | Disarm monitoring and close webcam immediately |
+| `/security_status` | Show armed state, cooldown, camera path & recent event log |
+| `/snapshot` | Instant photo from external USB security webcam |
+| `/snap` (`/cam`, `/photo`) | Instant photo from built-in webcam |
+| `/flights` / `/recap` | Live aircraft within `10 km` & daily `9:00 PM` recap |
+| `/sky` / `/briefing` | ISS passes, ISRO launches, weather & morning server briefing |
+| `/status`, `/temp`, `/ram`, `/disk`, `/top`, `/services`, `/adguard` | Live server diagnostics & AdGuard stats |
+| `/ai <question>` or plain text | Gemini AI assistant (`/clear` resets chat memory) |
 
-### Dashboard Keyboard Shortcuts
-- `[<-]` / `[->]` — Previous / Next slide
-- `[Space]` — Pause / resume auto-rotation
-- `[N]` — Next photo (Online photo on Page 0, Server photo on Page 6)
-- `[P]` — Toggle full-screen **Server Photos** (`Page 6`)
-- `[S]` — Toggle full-screen **Sky & ISS Dome** (`Page 4`)
-- `[M]` — Toggle full-screen **10 km Flight Radar** (`Page 5`)
-- `[1]`–`[3]` — Select upcoming ISS pass arc on Sky Dome
-- `[B]` — Toggle night mode & screen dimming | `[F]` — Toggle 12h/24h clock | `[H]` — Show key hints | `[Esc]` — Exit
+**Dashboard Keyboard Shortcuts:** `[<-/->]` Switch slide · `[Space]` Pause rotation · `[N]` Next photo · `[P]` Server Photos · `[S]` Sky Dome · `[M]` Flight Radar · `[1-3]` Select ISS pass · `[B]` Night dim · `[F]` 12/24h · `[H]` Hints · `[Esc]` Exit
 
 ---
 
-## Quick Setup Guide (Debian / Ubuntu / Raspberry Pi OS)
+## Repository Layout
 
-### 1. System Packages
-```bash
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-  python3 python3-tk python3-pil python3-pil.imagetk python3-requests \
-  python3-feedparser python3-psutil python3-opencv python3-numpy \
-  ffmpeg fswebcam v4l-utils x11-xserver-utils
-```
-
-### 2. Install the Wall Dashboard
-```bash
-cp dashboard/newdash25.py ~/newdash25.py
-cp dashboard/start_dashboard.sh ~/start_dashboard.sh
-chmod +x ~/newdash25.py ~/start_dashboard.sh
-
-cp dashboard/dashboard_config.example.json ~/dashboard_config.json
-nano ~/dashboard_config.json   # Set your city, lat/lon, AdGuard password & phone token
-```
-
-Link your file server photos folder so uploaded images appear on **Page 6 (`Server Photos`)**:
-```bash
-mkdir -p /home/shared/dashboard_photos
-ln -s /home/shared/dashboard_photos ~/slides_local
-```
-
-Start the dashboard (or add `~/start_dashboard.sh` to your LXDE/XFCE autostart):
-```bash
-~/start_dashboard.sh &
-```
-
-### 3. Install the Hardened Telegram Bot & Security Camera
-Create a dedicated unprivileged service user and state directory:
-```bash
-sudo useradd -r -s /usr/sbin/nologin -G video vickybot
-sudo mkdir -p /var/lib/vickyhome-tgbot
-sudo chown vickybot:vickybot /var/lib/vickyhome-tgbot
-sudo chmod 0700 /var/lib/vickyhome-tgbot
-```
-
-Install the bot and config:
-```bash
-sudo install -m 0755 telegram-bot/vickyhome-telegram-bot.py /usr/local/bin/vickyhome-telegram-bot.py
-sudo install -m 0755 telegram-bot/vickyhome-auth-alert.py /usr/local/bin/vickyhome-auth-alert.py
-
-sudo cp config/vickyhome-tgbot.conf.example /etc/vickyhome-tgbot.conf
-sudo chown vickybot:vickybot /etc/vickyhome-tgbot.conf
-sudo chmod 0400 /etc/vickyhome-tgbot.conf
-sudo nano /etc/vickyhome-tgbot.conf   # Add Telegram bot token, chat ID, optional Gemini/AdGuard creds
-
-sudo cp config/vickyhome-alerts.conf.example /etc/vickyhome-alerts.conf
-sudo chmod 0640 /etc/vickyhome-alerts.conf
-sudo nano /etc/vickyhome-alerts.conf
-```
-
-Find your persistent webcam device IDs (`ls -la /dev/v4l/by-id/`) and optionally override `SECURITY_DEVICE` / `SNAP_DEVICE` in `/etc/vickyhome-tgbot.conf`.
-
-If your generic USB webcam experiences UVC `-75`/`-32` (`Input/output error`) after idle USB autosuspend, install the udev rule (updating `idVendor`/`idProduct` from `lsusb`):
-```bash
-sudo install -m 0644 udev/99-usb-webcam-power.rules /etc/udev/rules.d/99-usb-webcam-power.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb
-```
-
-Enable the hardened `systemd` services and timers:
-```bash
-sudo cp systemd/vickyhome-*.service systemd/vickyhome-*.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now \
-  vickyhome-telegram-bot.service \
-  vickyhome-auth-alert.service \
-  vickyhome-briefing.timer \
-  vickyhome-flight-recap.timer
+```text
+homeserver_2026/
+├── install.sh                             # Interactive full-stack home server installer
+├── README.md                              # Full architecture & setup guide
+├── LICENSE                                # MIT License
+├── requirements.txt                       # Python dependencies
+├── dashboard/
+│   ├── newdash25.py                       # 7-slide fullscreen wall dashboard + :8765 remote
+│   ├── start_dashboard.sh                 # Single-instance launcher with crash-guard fallback
+│   ├── dashboard.desktop.example          # X11 desktop autostart entry
+│   └── dashboard_config.example.json      # Sanitized dashboard configuration template
+├── telegram-bot/
+│   ├── vickyhome-telegram-bot.py          # Hardened 2-way Telegram bot + OpenCV security camera
+│   └── vickyhome-auth-alert.py            # Real-time SSH & sudo login/intrusion alert daemon
+├── config/
+│   ├── vickyhome-tgbot.conf.example       # Sanitized Telegram bot config template
+│   ├── vickyhome-alerts.conf.example      # Sanitized SSH/sudo alert config template
+│   ├── copyparty.env.example              # Sanitized Copyparty credentials template
+│   └── smb.conf.example                   # Samba LAN share + Recycle Bin config template
+├── scripts/
+│   └── auto_usb_mount.sh                  # Safe, non-destructive USB drive auto-mount script
+├── systemd/
+│   ├── filebrowser.service                # FileBrowser (:8080)
+│   ├── copyparty.service                  # Copyparty (:3923)
+│   ├── vickyhome-telegram-bot.service     # Hardened Telegram bot & security cam
+│   ├── vickyhome-auth-alert.service       # Real-time SSH/sudo alert monitor
+│   ├── vickyhome-briefing.service/.timer  # Daily 7:30 AM briefing
+│   └── vickyhome-flight-recap.service/.timer # Daily 9:00 PM flight recap
+├── udev/
+│   ├── 99-auto-usb-mount.rules            # Safe USB partition auto-mount rule
+│   └── 99-usb-webcam-power.rules          # Disables broken UVC USB webcam autosuspend
+└── docs/screenshots/                      # Privacy-blurred live dashboard screenshots
 ```
 
 ---
 
-## Security & Privacy Notes
-- **Never commit real `.conf` or `dashboard_config.json` files** — `.gitignore` blocks them automatically.
-- `vickyhome-telegram-bot.py` enforces **strict owner-only private chat authorization** (ignores groups, channels, bots, and forwarded messages).
-- Systemd services isolate filesystem writes exclusively to `/var/lib/vickyhome-tgbot` and limit `/dev` access strictly to video nodes.
+## Security & Safety Notes
+- **Zero Secrets Committed:** All tokens, passwords, API keys, and chat IDs are strictly excluded via `.gitignore`; real configurations live only locally under `/etc/` and `~/dashboard_config.json`.
+- **Safe USB Auto-Mount:** `scripts/auto_usb_mount.sh` strictly mounts already-formatted removable partitions and **never** runs `fdisk` or `mkfs` on disks.
+- **UFW Firewall Safety:** `install.sh` opens `22/tcp` (SSH) before enabling UFW to prevent remote lockouts.
 
 ---
 
 ## License
-MIT License — see [LICENSE](LICENSE). Feel free to fork, remix, and adapt these ideas for your own old-laptop or Raspberry Pi home server!
+MIT License — see [LICENSE](LICENSE).

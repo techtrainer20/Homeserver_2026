@@ -1,0 +1,15 @@
+[Unit]
+Description=Copyparty Drag-and-Drop File Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/copyparty
+ExecStart=/usr/bin/python3 /usr/local/bin/copyparty-sfx.py -i 0.0.0.0 -p 3923 -j 1 --usernames --no-thumb --hist /var/lib/copyparty --shr /shr --shr-who a -a ${CP_ACCT} -v /home/shared::A,admin
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
