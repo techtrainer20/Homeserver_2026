@@ -1,0 +1,28 @@
+# Copy to /etc/vickyhome-tgbot.conf with chmod 0400 and chown vickybot:vickybot
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_FROM_BOTFATHER
+TELEGRAM_CHAT_ID=YOUR_NUMERIC_TELEGRAM_USER_ID
+
+# Optional: AdGuard Home stats (/adguard, /briefing)
+ADGUARD_URL=http://127.0.0.1:8081
+ADGUARD_USER=YOUR_ADGUARD_USER
+ADGUARD_PASS=YOUR_ADGUARD_PASSWORD
+
+# Optional: Gemini AI assistant (/ai and plain-text chat)
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+GEMINI_MODEL=gemini-2.5-flash
+
+# Local wall dashboard API (for flight cache sharing)
+DASH_URL=http://127.0.0.1:8765
+DASH_TOKEN=CHANGE_ME_TOKEN
+
+# Background alert toggles (1=enabled, 0=disabled)
+FLIGHT_ALERTS=1
+SPACE_ALERTS=1
+
+# Optional webcam overrides (persistent /dev/v4l/by-id symlinks recommended)
+# SECURITY_DEVICE=/dev/v4l/by-id/usb-Generic_HD_camera-video-index0
+# SNAP_DEVICE=/dev/v4l/by-id/usb-Image_Processor_Lenovo_EasyCamera-video-index0
+# SECURITY_COOLDOWN=45
+# SECURITY_CLIP_SECONDS=8
+# SECURITY_MIN_AREA=1800
+# SECURITY_FPS=6

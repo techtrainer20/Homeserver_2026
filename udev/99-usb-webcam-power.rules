@@ -1,0 +1,3 @@
+# Prevent generic UVC USB webcams (e.g., 1903:8328) from entering broken USB autosuspend
+# Replace idVendor/idProduct with your webcam's lsusb IDs if different.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="1903", ATTR{idProduct}=="8328", TEST=="power/control", ATTR{power/control}="on"

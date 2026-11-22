@@ -1,0 +1,23 @@
+[Unit]
+Description=Send Daily 7:30 AM Morning Briefing to Telegram (Hardened)
+After=network-online.target AdGuardHome.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vickybot
+Group=vickybot
+ExecStart=/usr/bin/python3 -B -u /usr/local/bin/vickyhome-telegram-bot.py --send-briefing
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/etc/vickyhome-tgbot.conf
+ReadWritePaths=/var/lib/vickyhome-tgbot

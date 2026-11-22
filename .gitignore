@@ -1,0 +1,27 @@
+# Secrets & local runtime configs (never commit!)
+dashboard_config.json
+*.conf
+!*.conf.example
+!*.example.json
+
+# Python bytecode & virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime logs, caches, locks & backups
+*.log
+*.bak*
+*.db
+.cache/
+slides/
+slides_local/
+security_events.log
+security_state.json
+flights_log.json
+space_cache.json
+offset
+*.tmp
+.DS_Store
+Thumbs.db
