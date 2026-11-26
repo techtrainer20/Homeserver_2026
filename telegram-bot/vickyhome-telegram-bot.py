@@ -92,8 +92,8 @@ BOT_COMMANDS = [
     {"command": "snap", "description": "Take a live photo from built-in camera"},
     {"command": "flights", "description": "Live planes within 10 km of Chennai"},
     {"command": "recap", "description": "Today's 10 km Chennai flight recap"},
-    {"command": "sky", "description": "Chennai sky, ISS overhead & ISRO Sriharikota"},
-    {"command": "briefing", "description": "Chennai weather, health & AdGuard summary"},
+    {"command": "sky", "description": "Local sky, ISS overhead & ISRO Sriharikota"},
+    {"command": "briefing", "description": "Local weather, health & AdGuard summary"},
     {"command": "status", "description": "Full server health summary"},
     {"command": "temp", "description": "CPU & board temperature"},
     {"command": "ram", "description": "Memory, swap & top processes"},
@@ -150,10 +150,32 @@ def run_cmd(args, timeout=8):
         return 1, "", str(e)
 
 
+_ERR_LOG_LOCK = threading.Lock()
+_ERR_LOG_STATE = {}
+
+
+def _log_throttled(key, msg, min_interval=180):
+    now = time.monotonic()
+    with _ERR_LOG_LOCK:
+        prev_ts, skipped = _ERR_LOG_STATE.get(key, (0.0, 0))
+        if now - prev_ts < min_interval:
+            _ERR_LOG_STATE[key] = (prev_ts, skipped + 1)
+            return
+        _ERR_LOG_STATE[key] = (now, 0)
+    suffix = f" (suppressed {skipped} similar)" if skipped else ""
+    print(f"{msg}{suffix}", file=sys.stderr, flush=True)
+
+
+def _is_retryable_exc(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (408, 429, 500, 502, 503, 504)
+    return isinstance(exc, (urllib.error.URLError, socket.timeout, TimeoutError, OSError))
+
+
 def tg_api(token, method, data=None, timeout=35):
     url = f"https://api.telegram.org/bot{token}/{method}"
     body = None
-    headers = {}
+    headers = {"Connection": "close"}
     if data is not None:
         body = json.dumps(data).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -170,10 +192,20 @@ def tg_api(token, method, data=None, timeout=35):
 def send_message(token, chat_id, text):
     chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
     for chunk in chunks:
-        try:
-            tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=12)
-        except Exception as e:
-            print(f"[sendMessage error] {e}", file=sys.stderr, flush=True)
+        last_err = None
+        for attempt in range(3):
+            try:
+                tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=12)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2 and _is_retryable_exc(e):
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    break
+        if last_err is not None:
+            print(f"[sendMessage error] {last_err}", file=sys.stderr, flush=True)
 
 
 def read_uptime_load():
@@ -292,14 +324,24 @@ def _send_media(
         for k, v in extra_fields.items():
             fields[k] = str(v)
     body, ctype = build_multipart_form(fields, file_field, filename, content_type, data_bytes)
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": ctype},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_err = None
+    for attempt in range(3):
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": ctype, "Connection": "close"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_err = e
+            if attempt < 2 and _is_retryable_exc(e):
+                time.sleep(2 + attempt * 3)
+            else:
+                raise
+    raise last_err
 
 
 def send_photo(token, chat_id, jpg_bytes, caption="", timeout=25):
@@ -593,6 +635,16 @@ class _ClipRecorder:
                 pass
 
 
+def _set_security_armed_flag(armed):
+    with SECURITY_STATE_LOCK:
+        st = _atomic_json_read(SECURITY_STATE_PATH, {})
+        st["armed"] = bool(armed)
+        try:
+            _atomic_json_write(SECURITY_STATE_PATH, st, prefix="secst_", mode=0o644)
+        except Exception as e:
+            print(f"[security armed flag error] {e}", file=sys.stderr, flush=True)
+
+
 def _append_security_event(event_type, detail_str, snapshot_sent=False, clip_sec=0.0):
     now_dt = datetime.datetime.now()
     ts_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -632,7 +684,7 @@ def _append_security_event(event_type, detail_str, snapshot_sent=False, clip_sec
         recent.append(entry)
         st["recent_events"] = recent[-10:]
         try:
-            _atomic_json_write(SECURITY_STATE_PATH, st, prefix="secst_")
+            _atomic_json_write(SECURITY_STATE_PATH, st, prefix="secst_", mode=0o644)
         except Exception as e:
             print(f"[security state write error] {e}", file=sys.stderr, flush=True)
 
@@ -705,6 +757,7 @@ class SecurityMonitor:
             self.disarm()
             return False, f"Failed to start security camera ({start_status['err']})."
 
+        _set_security_armed_flag(True)
         return True, (
             "Security Mode ENABLED\n\n"
             f"- Camera: USB HD Webcam ({resolved}, 640x480)\n"
@@ -736,6 +789,7 @@ class SecurityMonitor:
         with self._frame_lock:
             self._latest_frame = None
             self._latest_ts = 0.0
+        _set_security_armed_flag(False)
         if not was_armed:
             return "Security mode is already OFF (webcam inactive)."
         dur_s = max(0, int(time.time() - started_at)) if started_at else 0
@@ -1043,6 +1097,7 @@ class SecurityMonitor:
                 with self._lock:
                     self._stream = None
                     self._armed = False
+                _set_security_armed_flag(False)
 
 
 SECURITY_MONITOR = SecurityMonitor()
@@ -1062,8 +1117,8 @@ def cmd_help(_cfg):
         "/clear - Clear short-term AI chat memory\n"
         "/flights - Live planes within 10 km of Chennai\n"
         "/recap - Today's 10 km flight recap & special sightings\n"
-        "/sky - Chennai sky: Sun/Moon, ISS overhead & ISRO\n"
-        "/briefing - Chennai weather, server health & AdGuard summary\n"
+        "/sky - Local sky: Sun/Moon, ISS overhead & ISRO\n"
+        "/briefing - Local weather, server health & AdGuard summary\n"
         "/status - Full server health overview\n"
         "/temp - CPU & thermal sensor temps\n"
         "/ram - RAM, swap & top memory apps\n"
@@ -1148,7 +1203,7 @@ def cmd_services(_cfg):
         icon = "OK" if st == "active" else st.upper()
         lines.append(f"- {label} ({unit}): {icon}")
 
-    rc_dash, dash_pid, _ = run_cmd(["pgrep", "-f", "newdash25.py"])
+    rc_dash, dash_pid, _ = run_cmd(["pgrep", "-f", "/home/vicky/newdash25.py"])
     lines.append(
         f"- Dashboard (newdash25.py): {'OK (PID ' + dash_pid.splitlines()[0] + ')' if rc_dash == 0 and dash_pid else 'STOPPED'}"
     )
@@ -1270,7 +1325,7 @@ def moon_phase_info(dt_utc=None):
     return names[index], int(round(phase_days)), illum
 
 
-def fetch_chennai_weather_and_sun():
+def fetch_local_weather_and_sun():
     """Fetch current weather, forecast, and sunrise/sunset for Chennai/Chennai from Open-Meteo."""
     for attempt in range(2):
         try:
@@ -1313,8 +1368,8 @@ def fetch_chennai_weather_and_sun():
                 return [f"- Weather unavailable ({e})"], [f"- Moon: {m_name} (Day {m_day}, ~{m_illum}% lit)"]
 
 
-def fetch_chennai_weather():
-    weather_lines, _ = fetch_chennai_weather_and_sun()
+def fetch_local_weather():
+    weather_lines, _ = fetch_local_weather_and_sun()
     return weather_lines
 
 
@@ -1347,7 +1402,7 @@ def cmd_briefing(cfg):
     )
     temp_summary = ", ".join(f"{n} {t:.1f} C" for n, t in temps) if temps else "n/a"
 
-    weather_lines, sky_lines = fetch_chennai_weather_and_sun()
+    weather_lines, sky_lines = fetch_local_weather_and_sun()
     try:
         sp_note = get_briefing_sky_note()
         if sp_note:
@@ -1381,7 +1436,7 @@ def cmd_briefing(cfg):
     lines = [
         f"Morning Briefing - {now_str}",
         "",
-        "Chennai Weather",
+        "Local Weather",
         *weather_lines,
         "",
         "Chennai Sky",
@@ -1490,14 +1545,14 @@ def _atomic_json_read(path, default):
         return default
 
 
-def _atomic_json_write(path, data, prefix="st_"):
+def _atomic_json_write(path, data, prefix="st_", mode=0o600):
     parent = os.path.dirname(path)
     os.makedirs(parent, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=".json", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        os.chmod(tmp_path, 0o600)
+        os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except Exception:
         try:
@@ -1708,9 +1763,9 @@ def format_flight_card(fl, location="Chennai"):
     dist = f"{fl.get('dist_km', '?')} km {fl.get('compass', '')}".strip()
     track_txt = f" (Heading {fl['track']} deg)" if fl.get("track") is not None else ""
     header = (
-        f"[SPECIAL: {', '.join(tags)}] Flight Over {location} (Home)"
+        f"[SPECIAL: {', '.join(tags)}] Flight Over {location} "
         if tags
-        else f"Flight Over {location} (Home)"
+        else f"Flight Over {location} "
     )
     highlight_line = f"Highlight: {', '.join(tags)}\n" if tags else ""
     return (
@@ -1743,7 +1798,7 @@ def cmd_flights(cfg):
         cards = [format_flight_card(fl, loc) for fl in overhead[:3]]
         return "\n\n---\n\n".join(cards)
 
-    return f"No flights within {radius_lbl} of {loc} (Home) right now."
+    return f"No flights within {radius_lbl} of {loc}  right now."
 
 
 def build_flight_recap(date_str=None):
@@ -1763,7 +1818,7 @@ def build_flight_recap(date_str=None):
     ]
 
     radius_lbl = f"{int(FLIGHT_RADIUS_KM) if float(FLIGHT_RADIUS_KM).is_integer() else FLIGHT_RADIUS_KM} km"
-    header = f"Chennai (Home) Flight Recap - {date_lbl}"
+    header = f"Chennai Flight Recap - {date_lbl}"
     if not visits:
         return f"{header}\n\nNo aircraft crossed inside {radius_lbl} today yet."
 
@@ -1887,7 +1942,7 @@ def flight_alert_worker(cfg, token, chat_id):
                 seen[hx] = now
                 send_message(token, chat_id, format_flight_card(fl, loc))
         except Exception as e:
-            print(f"[flight alert error] {e}", file=sys.stderr, flush=True)
+            _log_throttled("flight_alert", f"[flight alert error] {e}", min_interval=180)
         time.sleep(20)
 
 
@@ -2183,7 +2238,7 @@ def get_briefing_sky_note():
             if p.get("visible") and p.get("max_el", 0) >= 25.0 and 0 < (p["start"] - now) <= 86400
         ]
         if passes:
-            parts.append(f"Visible ISS pass over Chennai: {format_iss_pass_line(passes[0])}")
+            parts.append(f"Visible ISS pass over Home: {format_iss_pass_line(passes[0])}")
     except Exception:
         pass
     try:
@@ -2201,14 +2256,14 @@ def get_briefing_sky_note():
 def cmd_sky(_cfg):
     now = time.time()
     ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-    lines = ["Chennai / Chennai Sky Report (Home)", ""]
+    lines = ["Chennai Sky Report ", ""]
 
-    _, sky_lines = fetch_chennai_weather_and_sun()
+    _, sky_lines = fetch_local_weather_and_sun()
     lines.append("Sun & Moon Today")
     lines.extend(sky_lines)
     lines.append("")
 
-    lines.append("ISS Over Chennai Now")
+    lines.append("ISS Over Home Now")
     try:
         live = fetch_live_iss()
         if live["dist_km"] <= 1600:
@@ -2217,12 +2272,12 @@ def cmd_sky(_cfg):
                 f"({live['alt_km']} km alt, {live['speed_kmh']:,} km/h, {live['visibility']})"
             )
         else:
-            lines.append("- Not over Chennai horizon right now")
+            lines.append("- Not over Home horizon right now")
     except Exception as e:
         lines.append(f"- ISS check unavailable ({e})")
 
     lines.append("")
-    lines.append("Visible ISS Passes Over Chennai (Max >= 25 deg)")
+    lines.append("Visible ISS Passes Over Home (Max >= 25 deg)")
     try:
         all_p = predict_iss_passes(days=21)
         vis_p = [
@@ -2238,7 +2293,7 @@ def cmd_sky(_cfg):
             if hi_p:
                 nx = hi_p[0]
                 why = "daytime" if nx.get("sun_el", 0) > -5.5 else "Earth shadow"
-                lines.append(f"- Next non-visible Chennai pass ({why}): {format_iss_pass_line(nx)}")
+                lines.append(f"- Next non-visible Local pass ({why}): {format_iss_pass_line(nx)}")
     except Exception as e:
         lines.append(f"- ISS pass scan unavailable ({e})")
 
@@ -2313,7 +2368,7 @@ def space_alert_worker(cfg, token, chat_id):
                     c2["alerted_launches"] = alerted_ln
                     _atomic_json_write(SPACE_CACHE_PATH, c2, prefix="sp_")
         except Exception as e:
-            print(f"[space alert error] {e}", file=sys.stderr, flush=True)
+            _log_throttled("space_alert", f"[space alert error] {e}", min_interval=300)
         time.sleep(300)
 
 
@@ -2400,7 +2455,7 @@ def ask_gemini(cfg, prompt):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=25) as r:
                 data = json.loads(r.read().decode("utf-8"))
             cands = data.get("candidates") or []
             if not cands:
@@ -2552,6 +2607,8 @@ def main():
         _send_scheduled_report(token, chat_id, build_flight_recap(), "flight-recap")
         return
 
+    _set_security_armed_flag(False)
+
     for _ in range(6):
         try:
             tg_api(token, "setMyCommands", {"commands": BOT_COMMANDS}, timeout=10)
@@ -2580,12 +2637,14 @@ def main():
     ).start()
 
     offset = load_offset()
+    poll_backoff = 3
     while True:
         try:
             params = {"timeout": 25, "allowed_updates": ["message"]}
             if offset is not None:
                 params["offset"] = offset
             res = tg_api(token, "getUpdates", params, timeout=35)
+            poll_backoff = 3
             for upd in res.get("result", []):
                 uid = upd.get("update_id")
                 if uid is not None:
@@ -2595,11 +2654,13 @@ def main():
                 if msg:
                     handle_message(cfg, token, chat_id, msg)
         except urllib.error.HTTPError as e:
-            print(f"[tg http error] {e.code} {e.reason}", file=sys.stderr, flush=True)
-            time.sleep(5)
+            _log_throttled("tg_http", f"[tg http error] {e.code} {e.reason}", min_interval=120)
+            time.sleep(poll_backoff)
+            poll_backoff = min(poll_backoff * 2, 30)
         except Exception as e:
-            print(f"[tg poll error] {e}", file=sys.stderr, flush=True)
-            time.sleep(5)
+            _log_throttled("tg_poll", f"[tg poll error] {e}", min_interval=120)
+            time.sleep(poll_backoff)
+            poll_backoff = min(poll_backoff * 2, 30)
 
 
 if __name__ == "__main__":

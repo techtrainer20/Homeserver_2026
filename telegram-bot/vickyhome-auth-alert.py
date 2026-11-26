@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
-"""Lightweight real-time SSH & sudo intrusion alert monitor for Linux home servers."""
+"""Lightweight real-time SSH & sudo intrusion alert monitor for vickyhome."""
 
 import ipaddress
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
+# Prefer IPv4 for outbound HTTPS because tailscale0 advertises an IPv6 address while ISP IPv6 is unreachable.
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+
+def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    res = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    v4 = [r for r in res if r[0] == socket.AF_INET]
+    return v4 if v4 else res
+
+
+socket.getaddrinfo = _ipv4_first_getaddrinfo
+
 CONF_PATH = "/etc/vickyhome-alerts.conf"
 AUTH_LOG = "/var/log/auth.log"
+POST_SEM = threading.Semaphore(6)
 
 RE_SSH_OK = re.compile(r"sshd\[\d+\]:\s+Accepted\s+(\S+)\s+for\s+(\S+)\s+from\s+([\da-fA-F.:]+)")
 RE_SSH_FAIL = re.compile(r"sshd\[\d+\]:\s+(?:Failed\s+\S+\s+for(?:\s+invalid user)?\s+|Invalid user\s+)(\S+)\s+from\s+([\da-fA-F.:]+)")
@@ -54,6 +69,28 @@ def classify_ip(ip_str):
         return "Unknown Network"
 
 
+def _post_with_retry(make_req, label, attempts=3, timeout=10):
+    last_err = None
+    for idx in range(attempts):
+        try:
+            with urllib.request.urlopen(make_req(), timeout=timeout):
+                return
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if idx + 1 < attempts and e.code in (408, 429, 500, 502, 503, 504):
+                time.sleep(2 + idx * 3)
+            else:
+                break
+        except Exception as e:
+            last_err = e
+            if idx + 1 < attempts:
+                time.sleep(2 + idx * 3)
+            else:
+                break
+    if last_err is not None:
+        print(f"[{label} error] {last_err}", file=sys.stderr, flush=True)
+
+
 def send_alert(cfg, title, message, priority="high", tags="warning"):
     ntfy_topic = cfg.get("NTFY_TOPIC", "")
     ntfy_srv = cfg.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -61,39 +98,36 @@ def send_alert(cfg, title, message, priority="high", tags="warning"):
     tg_chat = cfg.get("TELEGRAM_CHAT_ID", "")
 
     def _post():
-        if ntfy_topic:
-            try:
-                req = urllib.request.Request(
-                    f"{ntfy_srv}/{ntfy_topic}",
-                    data=message.encode("utf-8"),
-                    headers={
-                        "Title": title,
-                        "Priority": priority,
-                        "Tags": tags,
-                        "Content-Type": "text/plain; charset=utf-8",
-                    },
-                    method="POST",
+        if not POST_SEM.acquire(timeout=2):
+            return
+        try:
+            if ntfy_topic:
+                ntfy_url = f"{ntfy_srv}/{ntfy_topic}"
+                ntfy_data = message.encode("utf-8")
+                ntfy_headers = {
+                    "Title": title,
+                    "Priority": priority,
+                    "Tags": tags,
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Connection": "close",
+                }
+                _post_with_retry(
+                    lambda: urllib.request.Request(ntfy_url, data=ntfy_data, headers=ntfy_headers, method="POST"),
+                    "ntfy",
                 )
-                with urllib.request.urlopen(req, timeout=6):
-                    pass
-            except Exception as e:
-                print(f"[ntfy error] {e}", file=sys.stderr, flush=True)
 
-        if tg_tok and tg_chat:
-            try:
+            if tg_tok and tg_chat:
+                tg_url = f"https://api.telegram.org/bot{tg_tok}/sendMessage"
                 payload = urllib.parse.urlencode({
                     "chat_id": tg_chat,
                     "text": f"{title}\n{message}",
                 }).encode("utf-8")
-                req = urllib.request.Request(
-                    f"https://api.telegram.org/bot{tg_tok}/sendMessage",
-                    data=payload,
-                    method="POST",
+                _post_with_retry(
+                    lambda: urllib.request.Request(tg_url, data=payload, headers={"Connection": "close"}, method="POST"),
+                    "telegram",
                 )
-                with urllib.request.urlopen(req, timeout=6):
-                    pass
-            except Exception as e:
-                print(f"[telegram error] {e}", file=sys.stderr, flush=True)
+        finally:
+            POST_SEM.release()
 
     threading.Thread(target=_post, daemon=True).start()
 

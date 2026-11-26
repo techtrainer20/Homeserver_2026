@@ -10,15 +10,26 @@ Turn an old **1 GB RAM / 32-bit laptop** (like a Lenovo IdeaPad S10e running Deb
 
 ---
 
-## Live Wall Dashboard Screenshots (`1024x576`)
+## Live Wall Dashboard Screenshots (`1024x576` — `v1.2`)
 
-| Main Dashboard (Clock, Weather, Events & Online Photos) | Full-Screen All-Sky ISS Dome & ISRO Manifest |
+| Main Dashboard (Clock, Weather, Events & Online Photos) | Upgraded System Health v1.2 (Bandwidth, Services & Security) |
 | :---: | :---: |
-| ![Main Slide](docs/screenshots/main-slide.png) | ![Sky Dome Slide](docs/screenshots/sky-dome.png) |
+| ![Main Slide](docs/screenshots/main-slide.png) | ![System Health v1.2](docs/screenshots/system-v12.png) |
 
-| Full-Screen 10 km Local Flight Radar (Auto-Popup) | Full-Screen File-Server Photo Gallery (Blurred Backdrop) |
+| Full-Screen All-Sky ISS Dome & ISRO Manifest | Full-Screen 10 km Local Flight Radar (Auto-Popup) |
 | :---: | :---: |
-| ![Flight Radar Slide](docs/screenshots/flight-radar.png) | ![Server Photos Slide](docs/screenshots/server-photos.png) |
+| ![Sky Dome Slide](docs/screenshots/sky-dome.png) | ![Flight Radar Slide](docs/screenshots/flight-radar.png) |
+
+| Full-Screen File-Server Photo Gallery (Blurred Backdrop) |
+| :---: |
+| ![Server Photos Slide](docs/screenshots/server-photos.png) |
+
+### What's New in `newdash` v1.2
+- **Modern Header & Navigation:** `v1.2` version pill, clickable 7-slide indicator dots, smooth 2px slide-cycle progress bar, dark pill photo captions, instant first photo load on startup, and live red `SEC ARMED` header pill whenever the USB security camera is armed.
+- **Complete Multi-Theme Engine + OLED Mode:** Full theme synchronization across all slides (`Auto`, `Day`, `Evening`, `Night`, and pure-black `OLED`), switchable via `[T]` or the Phone Remote.
+- **Live Network, Storage, Service & Security Telemetry (System Slide):** Real-time RX/TX bandwidth (`KB/s` / `MB/s` from `/proc/net/dev`), 3-series `CPU • RAM • NET` sparkline with axis guides, USB flash-drive mount & free-space telemetry, live core service health chips (`AGH`, `FB`, `CP`, `SMB`, `TS`, `BOT`), and live Security Camera armed state + event counter.
+- **Redesigned Offline-First Phone Remote (`:8765`):** Live 5-second telemetry dashboard (`/api/status`), brightness slider (`20%`–`100%`), instant theme switcher, custom banner duration & clear button, custom countdown timer, quick links to FileBrowser/Copyparty/AdGuard/Cockpit, and toast feedback.
+- **Network Resilience Hardening:** IPv4-first DNS resolution across dashboard, Telegram bot, and SSH/sudo auth monitor; pooled HTTP retries with timeouts (including RSS feeds); multi-threaded Phone Remote server; exponential backoff; and multi-attempt Telegram alert/media delivery.
 
 ---
 
@@ -132,7 +143,7 @@ After `install.sh` completes, finish these 4 quick personalization steps:
 Engineered in pure Python (`tkinter` + `Pillow`) with zero browser/Electron overhead (~1 GB RAM friendly):
 - **Page 0 — Main:** Clock (`12h`/`24h`), live weather + animated icon, upcoming reminders, and online Bing/Picsum photos.
 - **Page 1 — Weather Detail:** 12-hour forecast & rain-chance chart, sunrise/sunset, and moon phase.
-- **Page 2 — System Health:** CPU/RAM sparklines, disk space, router/internet ping, Tailscale status, Docker count, and live **AdGuard Home** blocked queries.
+- **Page 2 — System Health (`v1.2`):** CPU/RAM/Network 3-series sparklines, load average, disk & USB drive free space, router/internet ping, real-time RX/TX bandwidth, live core service chips (`AGH`, `FB`, `CP`, `SMB`, `TS`, `BOT`), Security Camera armed/event status, Tailscale status, and live **AdGuard Home** blocked queries.
 - **Page 3 — Money & Quotes:** Currency/metals widget & daily quote card.
 - **Page 4 — All-Sky ISS Dome & Space:** Stereographic sky dome with animated visible ISS pass arcs (`max elevation >= 25°`), real-time ISS telemetry, sun/moon almanac, and upcoming ISRO launches (`42° NE` beacon).
 - **Page 5 — 10 km Flight Radar (Auto-Popup):** Dark CartoDB map tiles with `5 km` / `10 km` rings. Automatically switches full-screen whenever an aircraft enters `10 km` (`adsb.fi`/`OpenSky` + `adsbdb` routes) and restores the previous slide once clear.
@@ -162,7 +173,7 @@ Runs as unprivileged user `vickybot` inside a strict `systemd` sandbox (`Protect
 | `/status`, `/temp`, `/ram`, `/disk`, `/top`, `/services`, `/adguard` | Live server diagnostics & AdGuard stats |
 | `/ai <question>` or plain text | Gemini AI assistant (`/clear` resets chat memory) |
 
-**Dashboard Keyboard Shortcuts:** `[<-/->]` Switch slide · `[Space]` Pause rotation · `[N]` Next photo · `[P]` Server Photos · `[S]` Sky Dome · `[M]` Flight Radar · `[1-3]` Select ISS pass · `[B]` Night dim · `[F]` 12/24h · `[H]` Hints · `[Esc]` Exit
+**Dashboard Keyboard Shortcuts:** `[<-/->]` Switch slide · `[Space]` Pause rotation · `[N]` Next photo · `[P]` Server Photos · `[S]` Sky Dome · `[M]` Flight Radar · `[1-3]` Select ISS pass · `[T]` Cycle theme (`Day`/`Evening`/`Night`/`OLED`) · `[B]` Night dim · `[F]` 12/24h · `[H]` Hints · `[Esc]` Exit
 
 ---
 

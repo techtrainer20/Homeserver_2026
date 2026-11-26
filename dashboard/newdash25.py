@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-newdash26.py - Redesigned, Modular, Low-overhead Fullscreen Dashboard
+newdash25.py (v1.2) - Redesigned, Modular, Low-overhead Fullscreen Dashboard
 Engineered for Lenovo S10e (Debian i686, 1024x576 resolution, ~1GB RAM).
 Strictly BMP-compliant (U+0000 to U+FFFF) for Debian 32-bit Tcl/Tk.
 """
+
+DASHBOARD_VERSION = "1.2"
 
 import os
 import sys
@@ -12,6 +14,9 @@ import glob
 import math
 import json
 import random
+import shutil
+import socket
+import socketserver
 import urllib.parse
 import threading
 import subprocess
@@ -23,7 +28,49 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import tkinter as tk
 from PIL import Image, ImageTk, ImageOps, ImageEnhance, ImageFilter
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import feedparser
+
+# Prefer IPv4 for outbound HTTPS because tailscale0 advertises an IPv6 address while ISP IPv6 is unreachable.
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    res = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    v4 = [r for r in res if r[0] == socket.AF_INET]
+    return v4 if v4 else res
+
+socket.getaddrinfo = _ipv4_first_getaddrinfo
+
+def _build_http_session():
+    sess = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=1,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=retry)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    sess.headers.update({"User-Agent": "Mozilla/5.0 homeserver-dashboard"})
+    return sess
+
+HTTP_SESSION = _build_http_session()
+_NET_ERR_LOCK = threading.Lock()
+_NET_ERR_LAST = {}
+
+def log_net_error(key, msg, min_interval=180):
+    now = time.time()
+    with _NET_ERR_LOCK:
+        prev_ts, suppressed = _NET_ERR_LAST.get(key, (0.0, 0))
+        if now - prev_ts < min_interval:
+            _NET_ERR_LAST[key] = (prev_ts, suppressed + 1)
+            return
+        _NET_ERR_LAST[key] = (now, 0)
+    suffix = f" (suppressed {suppressed} similar)" if suppressed else ""
+    log_msg(f"{msg}{suffix}")
 
 # BMP text sanitizer for 32-bit Debian Tcl/Tk compatibility
 def safe_tcl(text):
@@ -127,7 +174,7 @@ DEFAULT_CONFIG = {
     "adguard": {
         "enabled": True,
         "url": "http://127.0.0.1:8081/control/stats",
-        "username": "vicky",
+        "username": "admin",
         "password": ""
     },
     "flights": {
@@ -215,8 +262,28 @@ THEMES = {
         "accent": "#D97706",
         "news_bg": "#000000",
         "alert_bg": "#991B1B"
+    },
+    "oled": {
+        "bg": "#000000",
+        "card_bg": "#05070B",
+        "card_border": "#142033",
+        "fg": "#F1F5F9",
+        "fg_sub": "#64748B",
+        "accent": "#38BDF8",
+        "news_bg": "#000000",
+        "alert_bg": "#7F1D1D"
     }
 }
+
+SECURITY_STATE_FILE = "/var/lib/vickyhome-tgbot/security_state.json"
+CORE_SERVICE_SPECS = [
+    ("AGH", "AdGuardHome.service"),
+    ("FB", "filebrowser.service"),
+    ("CP", "copyparty.service"),
+    ("SMB", "smbd.service"),
+    ("TS", "tailscaled.service"),
+    ("BOT", "vickyhome-telegram-bot.service"),
+]
 
 # ================= STATE HOLDER =================
 class DashboardState:
@@ -260,6 +327,16 @@ class DashboardState:
             "ads_blocked": "--",
             "ads_percent": "--",
             "dns_queries": "--",
+            "lan_ip": "--",
+            "net_rx_kbs": 0.0,
+            "net_tx_kbs": 0.0,
+            "net_history": [0.0] * 20,
+            "usb_status": "Not mounted",
+            "load_avg": "--",
+            "services": {},
+            "security_armed": False,
+            "security_events": 0,
+            "security_last": "",
             "cpu_history": [0.0] * 20,
             "ram_history": [0.0] * 20
         }
@@ -290,6 +367,9 @@ class DashboardState:
         self.last_flight_seen = None
         self.flight_map_toggle_req = False
         self.page_switch_req = None
+        self.theme_switch_req = None
+        self.time_fmt_toggle_req = False
+        self.brightness_level = 1.0
         self.space = {
             "live": None,
             "passes": [],
@@ -357,6 +437,8 @@ XRANDR_OUTPUT = get_xrandr_output()
 def set_screen_brightness(level):
     try:
         lvl = max(0.2, min(1.0, float(level)))
+        with STATE.lock:
+            STATE.brightness_level = round(lvl, 2)
         subprocess.run(
             f"xrandr --output {XRANDR_OUTPUT} --brightness {lvl:.2f}",
             shell=True,
@@ -373,7 +455,7 @@ def download_weather_icons():
         fname = os.path.join(ICON_DIR, f"{name}.png")
         if not os.path.exists(fname) or os.path.getsize(fname) == 0:
             try:
-                r = requests.get(url, headers=headers, timeout=8)
+                r = HTTP_SESSION.get(url, headers=headers, timeout=(5, 8))
                 if r.status_code == 200:
                     with open(fname, "wb") as f:
                         f.write(r.content)
@@ -402,10 +484,12 @@ def weather_worker():
         f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}"
         "&current=european_aqi,us_aqi,pm2_5"
     )
+    fail_backoff = 30
 
     while True:
+        sleep_sec = 900
         try:
-            r = requests.get(weather_url, headers=headers, timeout=10)
+            r = HTTP_SESSION.get(weather_url, headers=headers, timeout=(5, 10))
             r.raise_for_status()
             data = r.json()
 
@@ -482,7 +566,7 @@ def weather_worker():
 
             aqi_val = "--"
             try:
-                r_aqi = requests.get(aqi_url, headers=headers, timeout=6)
+                r_aqi = HTTP_SESSION.get(aqi_url, headers=headers, timeout=(4, 6))
                 if r_aqi.status_code == 200:
                     aqi_data = r_aqi.json().get("current", {})
                     aqi_val = aqi_data.get("european_aqi", aqi_data.get("us_aqi", "--"))
@@ -503,10 +587,10 @@ def weather_worker():
 
             now_time = datetime.datetime.now().strftime("%H:%M")
             weather_update = {
-                "temp": f"{temp}Â°C" if temp != "--" else "--",
-                "feels": f"{feels}Â°C" if feels != "--" else "--",
-                "temp_max": f"{daily_list[0]['max']}Â°C" if daily_list and daily_list[0]['max'] != '--' else "--",
-                "temp_min": f"{daily_list[0]['min']}Â°C" if daily_list and daily_list[0]['min'] != '--' else "--",
+                "temp": f"{temp}°C" if temp != "--" else "--",
+                "feels": f"{feels}°C" if feels != "--" else "--",
+                "temp_max": f"{daily_list[0]['max']}°C" if daily_list and daily_list[0]['max'] != '--' else "--",
+                "temp_min": f"{daily_list[0]['min']}°C" if daily_list and daily_list[0]['min'] != '--' else "--",
                 "humidity": f"{hum}%" if hum != "--" else "--",
                 "wind": f"{wind} km/h" if wind != "--" else "--",
                 "uv": uv_max,
@@ -524,28 +608,34 @@ def weather_worker():
             with STATE.lock:
                 STATE.weather.update(weather_update)
                 save_cache("weather", weather_update)
+                if STATE.health_warning and "Weather" in STATE.health_warning:
+                    STATE.health_warning = None
 
                 new_alerts = [a for a in STATE.alerts if "Rain expected" not in a and "Extreme Heat" not in a and "Poor Air Quality" not in a]
                 if rain_within_2h:
                     new_alerts.append("[ALERT] Rain expected within 2 hours")
                 if isinstance(feels, (int, float)) and feels >= CONFIG["alerts"]["heat_index_threshold_c"]:
-                    new_alerts.append(f"[ALERT] Extreme Heat Alert: Feels like {feels}Â°C")
+                    new_alerts.append(f"[ALERT] Extreme Heat Alert: Feels like {feels}°C")
                 if isinstance(aqi_val, (int, float)) and aqi_val > CONFIG["alerts"]["aqi_poor_threshold"]:
                     new_alerts.append(f"[ALERT] Poor Air Quality (AQI {aqi_val})")
                 STATE.alerts = new_alerts
+            fail_backoff = 30
 
         except Exception as e:
-            log_msg(f"Weather worker error: {e}")
+            log_net_error("weather", f"Weather worker error: {e}")
             with STATE.lock:
                 STATE.health_warning = "Weather sync failed, retrying..."
+            sleep_sec = fail_backoff
+            fail_backoff = min(fail_backoff * 2, 300)
 
-        time.sleep(900)
+        time.sleep(sleep_sec)
 
 def news_worker():
     cached = load_cache("news")
     if cached:
         with STATE.lock:
             STATE.news = cached
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     while True:
         all_items = []
@@ -556,7 +646,9 @@ def news_worker():
 
         for source_name, url in feeds.items():
             try:
-                feed = feedparser.parse(url)
+                r_feed = HTTP_SESSION.get(url, headers=headers, timeout=(5, 10))
+                r_feed.raise_for_status()
+                feed = feedparser.parse(r_feed.content)
                 count = 0
                 for entry in feed.entries:
                     if count >= CONFIG["news"].get("max_per_feed", 5):
@@ -589,7 +681,7 @@ def news_worker():
                     })
                     count += 1
             except Exception as e:
-                log_msg(f"Error parsing feed {source_name}: {e}")
+                log_net_error(f"news:{source_name}", f"Error parsing feed {source_name}: {e}")
 
         if all_items:
             random.shuffle(all_items)
@@ -597,8 +689,17 @@ def news_worker():
                 STATE.news = all_items
                 save_cache("news", all_items)
                 STATE.health_warning = None
+            time.sleep(1800)
+        else:
+            time.sleep(120)
 
-        time.sleep(1800)
+_FALLBACK_QUOTES = [
+    ("The secret of getting ahead is getting started.", "Mark Twain"),
+    ("Simplicity is the ultimate sophistication.", "Leonardo da Vinci"),
+    ("Well begun is half done.", "Aristotle"),
+    ("Small daily improvements over time lead to stunning results.", "Robin Sharma"),
+    ("Action is the foundational key to all success.", "Pablo Picasso"),
+]
 
 def rates_and_quotes_worker():
     cached_rates = load_cache("rates")
@@ -611,9 +712,12 @@ def rates_and_quotes_worker():
         with STATE.lock:
             STATE.quote.update(cached_quote)
 
+    fail_backoff = 120
     while True:
+        rates_ok = False
+        quote_ok = False
         try:
-            r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            r = HTTP_SESSION.get("https://open.er-api.com/v6/latest/USD", timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 rates = r.json().get("rates", {})
                 usd_inr = rates.get("INR", "--")
@@ -631,11 +735,12 @@ def rates_and_quotes_worker():
                 with STATE.lock:
                     STATE.finance.update(rates_data)
                     save_cache("rates", rates_data)
+                rates_ok = True
         except Exception as e:
-            log_msg(f"Rates fetch error: {e}")
+            log_net_error("rates", f"Rates fetch error: {e}")
 
         try:
-            r_q = requests.get("https://zenquotes.io/api/today", timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            r_q = HTTP_SESSION.get("https://zenquotes.io/api/today", timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
             if r_q.status_code == 200:
                 q_list = r_q.json()
                 if q_list and isinstance(q_list, list) and len(q_list) > 0:
@@ -646,15 +751,153 @@ def rates_and_quotes_worker():
                     with STATE.lock:
                         STATE.quote.update(q_obj)
                         save_cache("quote", q_obj)
+                    quote_ok = True
         except Exception as e:
-            log_msg(f"Quote fetch error: {e}")
+            try:
+                r_q2 = HTTP_SESSION.get("https://dummyjson.com/quotes/random", timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
+                if r_q2.status_code == 200:
+                    qd = r_q2.json()
+                    if qd.get("quote"):
+                        q_obj = {
+                            "text": safe_tcl(qd.get("quote")),
+                            "author": safe_tcl(qd.get("author", "Unknown"))
+                        }
+                        with STATE.lock:
+                            STATE.quote.update(q_obj)
+                            save_cache("quote", q_obj)
+                        quote_ok = True
+            except Exception:
+                log_net_error("quote", f"Quote fetch error: {e}")
+                if not cached_quote:
+                    qt, qa = random.choice(_FALLBACK_QUOTES)
+                    with STATE.lock:
+                        STATE.quote.update({"text": qt, "author": qa})
 
-        time.sleep(3600)
+        if rates_ok and quote_ok:
+            fail_backoff = 120
+            time.sleep(3600)
+        else:
+            time.sleep(fail_backoff)
+            fail_backoff = min(fail_backoff * 2, 900)
+
+def _read_net_bytes():
+    """Sum RX/TX bytes across active physical LAN/Wi-Fi interfaces from /proc/net/dev."""
+    rx_tot = 0
+    tx_tot = 0
+    try:
+        with open("/proc/net/dev", "r") as f:
+            for line in f.readlines()[2:]:
+                if ":" not in line:
+                    continue
+                iface, rest = line.split(":", 1)
+                iface = iface.strip()
+                if iface == "lo" or iface.startswith(("tailscale", "docker", "veth", "br-")):
+                    continue
+                cols = rest.split()
+                if len(cols) >= 9:
+                    rx_tot += int(cols[0])
+                    tx_tot += int(cols[8])
+    except Exception:
+        pass
+    return rx_tot, tx_tot
+
+def _format_rate(kbs):
+    val = max(0.0, float(kbs or 0.0))
+    if val >= 1024.0:
+        return f"{val / 1024.0:.1f} MB/s"
+    if val >= 100.0:
+        return f"{int(round(val))} KB/s"
+    return f"{val:.1f} KB/s"
+
+def _get_lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(1.0)
+        s.connect(("192.168.1.1", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "--"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+def _read_usb_status():
+    for mp in ("/media/usbdrive", "/home/shared/USB-Drive"):
+        try:
+            real_mp = os.path.realpath(mp)
+            if os.path.ismount(real_mp):
+                st = os.statvfs(real_mp)
+                tot_gb = (st.f_blocks * st.f_frsize) / float(1024 ** 3)
+                free_gb = (st.f_bavail * st.f_frsize) / float(1024 ** 3)
+                return f"USB: {free_gb:.1f}/{tot_gb:.0f} GB free"
+        except Exception:
+            pass
+    return "USB: Not mounted"
+
+def _read_core_services():
+    units = [u for _, u in CORE_SERVICE_SPECS]
+    out_map = {lbl: False for lbl, _ in CORE_SERVICE_SPECS}
+    try:
+        res = subprocess.run(
+            ["systemctl", "is-active"] + units,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        lines = (res.stdout or b"").decode("utf-8", errors="ignore").splitlines()
+        for idx, (lbl, _) in enumerate(CORE_SERVICE_SPECS):
+            if idx < len(lines) and lines[idx].strip() == "active":
+                out_map[lbl] = True
+    except Exception:
+        pass
+    return out_map
+
+def _read_security_status():
+    armed = False
+    events = 0
+    last_str = ""
+    try:
+        if os.path.exists(SECURITY_STATE_FILE):
+            with open(SECURITY_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            armed = bool(st.get("armed", False))
+            events = int(st.get("total_events", 0) or 0)
+            lev = st.get("last_event") or {}
+            if lev.get("ts"):
+                last_str = f"{lev.get('type', 'MOTION')} {str(lev.get('ts'))[-8:-3]}"
+    except Exception:
+        pass
+    if not armed:
+        try:
+            r = subprocess.run(
+                ["pgrep", "-f", "ffmpeg.*-f v4l2"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if r.returncode == 0:
+                armed = True
+        except Exception:
+            pass
+    return armed, events, last_str
 
 def system_stats_worker():
     prev_idle = 0
     prev_total = 0
+    prev_rx, prev_tx = _read_net_bytes()
+    prev_net_ts = time.time()
     adguard_tick = 0
+    has_docker = bool(shutil.which("docker"))
+    has_tailscale = bool(shutil.which("tailscale"))
+    inet_fail_streak = 0
+    last_good_inet_ms = "--"
+    last_ts_status = "Off"
+    last_services = {lbl: False for lbl, _ in CORE_SERVICE_SPECS}
+    last_lan_ip = _get_lan_ip()
+    last_usb = _read_usb_status()
+    last_sec = (False, 0, "")
 
     while True:
         try:
@@ -679,6 +922,13 @@ def system_stats_worker():
                         cpu_t = round(float(f.read().strip()) / 1000.0, 1)
                 except Exception:
                     pass
+
+            load_avg = "--"
+            try:
+                with open("/proc/loadavg", "r") as f:
+                    load_avg = f.read().split()[0]
+            except Exception:
+                pass
 
             ram_pct = 0.0
             mem_used_mb = 0
@@ -712,6 +962,13 @@ def system_stats_worker():
                 mins = int((up_sec % 3600) // 60)
                 uptime_str = f"{days}d {hrs}h {mins}m" if days > 0 else f"{hrs}h {mins}m"
 
+            now_net_ts = time.time()
+            cur_rx, cur_tx = _read_net_bytes()
+            dt_net = max(0.5, now_net_ts - prev_net_ts)
+            net_rx_kbs = max(0.0, (cur_rx - prev_rx) / 1024.0 / dt_net) if cur_rx >= prev_rx else 0.0
+            net_tx_kbs = max(0.0, (cur_tx - prev_tx) / 1024.0 / dt_net) if cur_tx >= prev_tx else 0.0
+            prev_rx, prev_tx, prev_net_ts = cur_rx, cur_tx, now_net_ts
+
             bat_status = "AC Online"
             acad_path = "/sys/class/power_supply/ACAD/online"
             bat_path = "/sys/class/power_supply/BAT0"
@@ -732,45 +989,89 @@ def system_stats_worker():
                     pass
 
             router_ms = "--"
-            inet_ms = "--"
+            inet_ms = last_good_inet_ms
             try:
-                res = subprocess.run("ping -c 1 -W 1 192.168.1.1", shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                res = subprocess.run(
+                    ["ping", "-n", "-c", "1", "-W", "1", "192.168.1.1"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                )
                 if res.returncode == 0:
-                    out = res.stdout.decode()
+                    out = res.stdout.decode("utf-8", errors="ignore")
                     if "time=" in out:
                         router_ms = out.split("time=")[1].split()[0] + "ms"
-                res2 = subprocess.run("ping -c 1 -W 1 1.1.1.1", shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                if res2.returncode == 0:
-                    out2 = res2.stdout.decode()
-                    if "time=" in out2:
-                        inet_ms = out2.split("time=")[1].split()[0] + "ms"
+                ping_ok = False
+                for probe_ip in ("1.1.1.1", "8.8.8.8"):
+                    res2 = subprocess.run(
+                        ["ping", "-n", "-c", "1", "-W", "1", probe_ip],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    if res2.returncode == 0:
+                        out2 = res2.stdout.decode("utf-8", errors="ignore")
+                        if "time=" in out2:
+                            inet_ms = out2.split("time=")[1].split()[0] + "ms"
+                            last_good_inet_ms = inet_ms
+                        ping_ok = True
+                        break
+                if ping_ok:
+                    inet_fail_streak = 0
                 else:
-                    inet_ms = "Offline"
+                    inet_fail_streak += 1
+                    if inet_fail_streak >= 3:
+                        inet_ms = "Offline"
             except Exception:
                 pass
 
             docker_cnt = 0
-            try:
-                d_out = subprocess.check_output("docker ps -q 2>/dev/null | wc -l", shell=True).decode().strip()
-                docker_cnt = int(d_out)
-            except: pass
+            if has_docker and adguard_tick % 6 == 0:
+                try:
+                    d_out = subprocess.check_output(
+                        ["docker", "ps", "-q"],
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    ).decode("utf-8", errors="ignore").strip()
+                    docker_cnt = len(d_out.splitlines()) if d_out else 0
+                except Exception:
+                    pass
 
-            ts_status = "Disconnected"
-            try:
-                t_out = subprocess.check_output("tailscale status 2>/dev/null | head -1", shell=True).decode().strip()
-                if "linux" in t_out.lower() or "100." in t_out:
-                    ts_status = "Connected"
-            except: pass
+            ts_status = last_ts_status
+            if has_tailscale and adguard_tick % 3 == 0:
+                try:
+                    t_res = subprocess.run(
+                        ["tailscale", "status"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    t_out = (t_res.stdout or b"").decode("utf-8", errors="ignore").splitlines()
+                    first_ln = t_out[0].strip() if t_out else ""
+                    if "linux" in first_ln.lower() or "100." in first_ln:
+                        ts_status = "Connected"
+                    else:
+                        ts_status = "Disconnected"
+                    last_ts_status = ts_status
+                except Exception:
+                    pass
+
+            if adguard_tick % 3 == 0:
+                last_services = _read_core_services()
+                last_usb = _read_usb_status()
+                last_lan_ip = _get_lan_ip()
+            if adguard_tick % 2 == 0:
+                last_sec = _read_security_status()
 
             ag_data = None
             if adguard_tick % 3 == 0:
                 ag_cfg = CONFIG.get("adguard", {})
                 if ag_cfg.get("enabled") and ag_cfg.get("password"):
                     try:
-                        r_ag = requests.get(
+                        r_ag = HTTP_SESSION.get(
                             ag_cfg.get("url", "http://127.0.0.1:8081/control/stats"),
                             auth=(ag_cfg.get("username", "vicky"), ag_cfg["password"]),
-                            timeout=3
+                            timeout=(2, 3)
                         )
                         if r_ag.status_code == 200:
                             js = r_ag.json()
@@ -779,30 +1080,45 @@ def system_stats_worker():
                             pct = (b_cnt / q_cnt * 100.0) if q_cnt > 0 else 0.0
                             ag_data = (f"{b_cnt:,}", f"{pct:.1f}%", f"{q_cnt:,}")
                     except Exception as ae:
-                        log_msg(f"AdGuard stats error: {ae}")
+                        log_net_error("adguard_stats", f"AdGuard stats error: {ae}")
             adguard_tick += 1
+
+            # Normalize network rate to 0-100 for sparkline overlay (log-like cap at 2048 KB/s)
+            net_tot_kbs = net_rx_kbs + net_tx_kbs
+            net_pct = min(100.0, (math.log10(1.0 + net_tot_kbs) / math.log10(2049.0)) * 100.0) if net_tot_kbs > 0 else 0.0
 
             with STATE.lock:
                 STATE.system["cpu_percent"] = round(cpu_pct, 1)
                 STATE.system["cpu_temp"] = cpu_t
+                STATE.system["load_avg"] = load_avg
                 STATE.system["ram_percent"] = ram_pct
                 STATE.system["ram_used_mb"] = mem_used_mb
                 STATE.system["ram_total_mb"] = mem_total_mb
                 STATE.system["disk_percent"] = disk_pct
                 STATE.system["disk_free_gb"] = disk_free_gb
+                STATE.system["usb_status"] = last_usb
                 STATE.system["uptime_str"] = uptime_str
                 STATE.system["battery_status"] = bat_status
                 STATE.system["router_ping"] = router_ms
                 STATE.system["inet_ping"] = inet_ms
+                STATE.system["lan_ip"] = last_lan_ip
+                STATE.system["net_rx_kbs"] = round(net_rx_kbs, 1)
+                STATE.system["net_tx_kbs"] = round(net_tx_kbs, 1)
                 STATE.system["tailscale_status"] = ts_status
                 STATE.system["docker_count"] = docker_cnt
+                STATE.system["services"] = dict(last_services)
+                STATE.system["security_armed"] = last_sec[0]
+                STATE.system["security_events"] = last_sec[1]
+                STATE.system["security_last"] = last_sec[2]
                 if ag_data is not None:
                     STATE.system["ads_blocked"], STATE.system["ads_percent"], STATE.system["dns_queries"] = ag_data
 
                 c_hist = STATE.system["cpu_history"][1:] + [cpu_pct]
                 r_hist = STATE.system["ram_history"][1:] + [ram_pct]
+                n_hist = STATE.system["net_history"][1:] + [round(net_pct, 1)]
                 STATE.system["cpu_history"] = c_hist
                 STATE.system["ram_history"] = r_hist
+                STATE.system["net_history"] = n_hist
 
                 if inet_ms == "Offline":
                     if "[ALERT] Internet connection down" not in STATE.alerts:
@@ -897,7 +1213,7 @@ def _lookup_flight_route(callsign, cache, headers):
         oldest = min(cache, key=lambda k: cache[k][0])
         cache.pop(oldest, None)
     try:
-        r = requests.get(f"https://api.adsbdb.com/v0/callsign/{cs}", headers=headers, timeout=4)
+        r = HTTP_SESSION.get(f"https://api.adsbdb.com/v0/callsign/{cs}", headers=headers, timeout=(3, 4))
         if r.status_code == 200:
             fr = (r.json().get("response") or {}).get("flightroute") or {}
             orig = fr.get("origin") or {}
@@ -1029,8 +1345,7 @@ def _fetch_map_mosaic(zoom, vx0, vy0, w_px, h_px):
     tx1 = int(math.floor((vx0 + w_px - 1) / 256.0))
     ty1 = int(math.floor((vy0 + h_px - 1) / 256.0))
     canvas_img = Image.new("RGB", (w_px, h_px), (6, 13, 26))
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "HomeFlightRadar/1.0"})
+    tile_headers = {"User-Agent": "HomeFlightRadar/1.0"}
 
     try:
         cached_files = sorted(glob.glob(os.path.join(MAP_TILE_CACHE, "*.png")), key=os.path.getmtime)
@@ -1054,14 +1369,14 @@ def _fetch_map_mosaic(zoom, vx0, vy0, w_px, h_px):
             if tile_img is None:
                 try:
                     base_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{zoom}/{ty}/{wx}"
-                    rb = sess.get(base_url, timeout=5)
+                    rb = HTTP_SESSION.get(base_url, headers=tile_headers, timeout=(4, 5))
                     if rb.status_code == 200:
                         base_l = Image.open(BytesIO(rb.content)).convert("L")
                         stretched = base_l.point(lambda p: max(0, min(255, int((p - 28) * 5.2))))
                         merged = ImageOps.colorize(stretched, black="#071020", white="#243F63").convert("RGBA")
                         try:
                             ref_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{zoom}/{ty}/{wx}"
-                            rr = sess.get(ref_url, timeout=4)
+                            rr = HTTP_SESSION.get(ref_url, headers=tile_headers, timeout=(3, 4))
                             if rr.status_code == 200:
                                 ref_img = Image.open(BytesIO(rr.content)).convert("RGBA")
                                 merged.paste(ref_img, (0, 0), ref_img)
@@ -1080,7 +1395,7 @@ def _fetch_map_mosaic(zoom, vx0, vy0, w_px, h_px):
 
 def _parse_adsbfi_flights(lat, lon, radius_nm, max_alt_ft, headers):
     url = f"https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{int(radius_nm)}"
-    r = requests.get(url, headers=headers, timeout=8)
+    r = HTTP_SESSION.get(url, headers=headers, timeout=(5, 8))
     if r.status_code != 200:
         raise RuntimeError(f"adsb.fi HTTP {r.status_code}")
     data = r.json()
@@ -1135,7 +1450,7 @@ def _parse_opensky_flights(lat, lon, radius_nm, max_alt_ft, headers):
         f"?lamin={lat - dlat:.4f}&lomin={lon - dlon:.4f}"
         f"&lamax={lat + dlat:.4f}&lomax={lon + dlon:.4f}"
     )
-    r = requests.get(url, headers=headers, timeout=8)
+    r = HTTP_SESSION.get(url, headers=headers, timeout=(5, 8))
     if r.status_code != 200:
         raise RuntimeError(f"opensky HTTP {r.status_code}")
     states = r.json().get("states") or []
@@ -1180,6 +1495,8 @@ def flights_worker():
     route_cache = {}
     trails = {}
     last_logged_top = None
+    last_ok_ts = time.time()
+    fail_streak = 0
     while True:
         f_cfg = CONFIG.get("flights", {})
         if not f_cfg.get("enabled", True):
@@ -1205,11 +1522,13 @@ def flights_worker():
             try:
                 all_fl = _parse_adsbfi_flights(lat, lon, scan_nm, max_alt_ft, headers)
             except Exception as e1:
-                log_msg(f"adsb.fi flight fetch fallback ({e1})")
+                log_net_error("adsbfi_fallback", f"adsb.fi flight fetch fallback ({e1})")
                 all_fl = _parse_opensky_flights(lat, lon, scan_nm, max_alt_ft, headers)
 
             all_fl.sort(key=lambda x: x["dist_km"])
             now = time.time()
+            last_ok_ts = now
+            fail_streak = 0
 
             # Prune old breadcrumb trails and record live positions
             for hx in [k for k, v in trails.items() if now - v[0] > 600]:
@@ -1256,9 +1575,15 @@ def flights_worker():
                 last_logged_top = top_id
 
         except Exception as e:
-            log_msg(f"Flights worker error: {e}")
+            fail_streak += 1
+            log_net_error("flights_worker", f"Flights worker error: {e}")
+            if time.time() - last_ok_ts > 90:
+                with STATE.lock:
+                    STATE.flights = []
+                    STATE.preview_flights = []
 
-        time.sleep(poll_sec)
+        sleep_for = poll_sec if fail_streak == 0 else min(60, poll_sec * min(3, fail_streak))
+        time.sleep(sleep_for)
 
 _SPACE_MU = 398600.4418
 _SPACE_RE = 6378.137
@@ -1367,14 +1692,14 @@ def _iss_pos_sun_at(tp, ts):
 
 def _fetch_iss_tle(headers):
     try:
-        r = requests.get("https://api.wheretheiss.at/v1/satellites/25544/tles", headers=headers, timeout=8)
+        r = HTTP_SESSION.get("https://api.wheretheiss.at/v1/satellites/25544/tles", headers=headers, timeout=(5, 8))
         if r.status_code == 200:
             d = r.json()
             if d.get("line1") and d.get("line2"):
                 return d["line1"].strip(), d["line2"].strip()
     except Exception:
         pass
-    r = requests.get("https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle", headers=headers, timeout=8)
+    r = HTTP_SESSION.get("https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle", headers=headers, timeout=(5, 8))
     r.raise_for_status()
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
     l1 = next(ln for ln in lines if ln.startswith("1 25544"))
@@ -1470,7 +1795,7 @@ def _compute_iss_passes(lat, lon, headers, days=21, force=False):
     return [p for p in passes if p.get("end", 0) > now]
 
 def _fetch_live_iss_telemetry(lat, lon, headers):
-    r = requests.get("https://api.wheretheiss.at/v1/satellites/25544", headers=headers, timeout=6)
+    r = HTTP_SESSION.get("https://api.wheretheiss.at/v1/satellites/25544", headers=headers, timeout=(5, 8))
     r.raise_for_status()
     d = r.json()
     i_lat = float(d["latitude"])
@@ -1499,10 +1824,10 @@ def _fetch_isro_launches(headers, force=False):
     cached = load_cache("space_isro") or {}
     if not force and cached and (now - cached.get("fetched_at", 0)) < 14400:
         return cached.get("isro") or []
-    r = requests.get(
+    r = HTTP_SESSION.get(
         "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=4&location__ids=14",
         headers=headers,
-        timeout=10,
+        timeout=(5, 10),
     )
     r.raise_for_status()
     items = []
@@ -1568,7 +1893,7 @@ def space_worker():
                     STATE.space["updated_at"] = now
                 last_pass_check = now
             except Exception as e:
-                log_msg(f"Sky ISS pass scan error: {e}")
+                log_net_error("sky_iss_pass", f"Sky ISS pass scan error: {e}")
 
         if now - last_isro_check >= 3600:
             try:
@@ -1577,7 +1902,7 @@ def space_worker():
                     STATE.space["isro"] = isro_list[:3]
                 last_isro_check = now
             except Exception as e:
-                log_msg(f"ISRO launch fetch error: {e}")
+                log_net_error("sky_isro", f"ISRO launch fetch error: {e}")
 
         live_sleep = 60
         try:
@@ -1588,7 +1913,8 @@ def space_worker():
             if live.get("dist_km", 99999) <= 2600:
                 live_sleep = 15
         except Exception as e:
-            log_msg(f"Live ISS telemetry error: {e}")
+            log_net_error("sky_iss_live", f"Live ISS telemetry error: {e}")
+            live_sleep = 120
 
         time.sleep(live_sleep)
 
@@ -1695,7 +2021,7 @@ def photo_manager_worker(img_width, img_height):
             if len(files) < max_cache:
                 downloaded = False
                 try:
-                    rb = requests.get(bing_api, timeout=15, headers=headers)
+                    rb = HTTP_SESSION.get(bing_api, timeout=(5, 12), headers=headers)
                     if rb.status_code == 200:
                         existing = {os.path.basename(f) for f in files}
                         for item in rb.json().get("images", []):
@@ -1704,7 +2030,7 @@ def photo_manager_worker(img_width, img_height):
                             if fname in existing:
                                 continue
                             img_url = "https://www.bing.com" + item["url"]
-                            ri = requests.get(img_url, timeout=20, headers=headers)
+                            ri = HTTP_SESSION.get(img_url, timeout=(6, 15), headers=headers)
                             if ri.status_code == 200:
                                 img = Image.open(BytesIO(ri.content))
                                 if img.mode != "RGB":
@@ -1716,11 +2042,11 @@ def photo_manager_worker(img_width, img_height):
                                 sleep_sec = 5
                                 break
                 except Exception as be:
-                    log_msg(f"Bing photo fetch error: {be}")
+                    log_net_error("bing_photo", f"Bing photo fetch error: {be}")
 
                 if not downloaded and len(files) < 2:
                     rand_id = random.randint(1000, 999999)
-                    r = requests.get(f"{picsum_url}?random={rand_id}", timeout=15, headers=headers, allow_redirects=True)
+                    r = HTTP_SESSION.get(f"{picsum_url}?random={rand_id}", timeout=(5, 12), headers=headers, allow_redirects=True)
                     if r.status_code == 200:
                         img = Image.open(BytesIO(r.content))
                         if img.mode != "RGB":
@@ -1730,13 +2056,21 @@ def photo_manager_worker(img_width, img_height):
                         backoff = 15
                         sleep_sec = 5
         except Exception as e:
-            log_msg(f"Photo manager error (retry in {backoff}s): {e}")
+            log_net_error("photo_mgr", f"Photo manager error (retry in {backoff}s): {e}")
             sleep_sec = backoff
             backoff = min(backoff * 2, 300)
         time.sleep(sleep_sec)
 
 # ================= PHONE CONTROL HTTP SERVER =================
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
 class PhoneControlHandler(BaseHTTPRequestHandler):
+    def setup(self):
+        self.request.settimeout(10.0)
+        super().setup()
+
     def log_message(self, format, *args):
         pass
 
@@ -1780,107 +2114,323 @@ class PhoneControlHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(payload).encode("utf-8"))
             return
 
+        if parsed.path == "/api/status":
+            page_names = ["Main", "Weather", "System", "Money", "Sky Dome", "Flight Radar", "Server Photos"]
+            with STATE.lock:
+                cur_p = STATE.active_page
+                s = dict(STATE.system)
+                w = dict(STATE.weather)
+                payload = {
+                    "version": DASHBOARD_VERSION,
+                    "location": CONFIG.get("location_name", "Chennai"),
+                    "active_page": cur_p,
+                    "active_page_name": page_names[cur_p] if 0 <= cur_p < len(page_names) else "Main",
+                    "rotation_paused": STATE.rotation_paused,
+                    "night_mode": STATE.night_mode_active,
+                    "theme": CONFIG.get("theme", "auto"),
+                    "time_format_24h": CONFIG.get("time_format_24h", False),
+                    "brightness": STATE.brightness_level,
+                    "timer_remaining": STATE.timer_seconds_remaining,
+                    "flights_count": len(STATE.flights),
+                    "weather": {
+                        "temp": w.get("temp", "--"),
+                        "feels": w.get("feels", "--"),
+                        "cond": w.get("cond", "--"),
+                        "humidity": w.get("humidity", "--"),
+                        "rain_chance": w.get("rain_chance", "--"),
+                        "aqi": w.get("aqi", "--"),
+                    },
+                    "system": {
+                        "cpu_percent": s.get("cpu_percent", 0.0),
+                        "cpu_temp": s.get("cpu_temp", 0.0),
+                        "load_avg": s.get("load_avg", "--"),
+                        "ram_percent": s.get("ram_percent", 0.0),
+                        "ram_used_mb": s.get("ram_used_mb", 0),
+                        "ram_total_mb": s.get("ram_total_mb", 0),
+                        "disk_percent": s.get("disk_percent", 0.0),
+                        "disk_free_gb": s.get("disk_free_gb", 0.0),
+                        "usb_status": s.get("usb_status", "Not mounted"),
+                        "uptime_str": s.get("uptime_str", "--"),
+                        "inet_ping": s.get("inet_ping", "--"),
+                        "router_ping": s.get("router_ping", "--"),
+                        "lan_ip": s.get("lan_ip", "--"),
+                        "net_rx": _format_rate(s.get("net_rx_kbs", 0.0)),
+                        "net_tx": _format_rate(s.get("net_tx_kbs", 0.0)),
+                        "tailscale_status": s.get("tailscale_status", "--"),
+                        "ads_blocked": s.get("ads_blocked", "--"),
+                        "ads_percent": s.get("ads_percent", "--"),
+                        "dns_queries": s.get("dns_queries", "--"),
+                        "services": dict(s.get("services") or {}),
+                        "security_armed": bool(s.get("security_armed", False)),
+                        "security_events": int(s.get("security_events", 0)),
+                        "security_last": s.get("security_last", ""),
+                    },
+                }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+            return
+
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Wall Dashboard Control</title>
+<title>Wall Dashboard Control v{DASHBOARD_VERSION}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-  body {{ background: #0F172A; color: #F8FAFC; padding: 16px; max-width: 500px; margin: 0 auto; }}
-  h1 {{ font-size: 1.4rem; margin-bottom: 8px; color: #38BDF8; }}
-  .card {{ background: #1E293B; border-radius: 12px; padding: 14px; margin-bottom: 14px; border: 1px solid #334155; }}
-  .card h2 {{ font-size: 1rem; margin-bottom: 10px; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.5px; }}
-  button, input, select {{ width: 100%; padding: 12px; border-radius: 8px; border: none; font-size: 1rem; margin-top: 6px; }}
-  input, select {{ background: #0F172A; color: #F8FAFC; border: 1px solid #475569; }}
-  button {{ background: #0284C7; color: white; font-weight: 600; cursor: pointer; transition: 0.15s; }}
-  button:active {{ transform: scale(0.98); background: #0369A1; }}
+  body {{ background: #070C16; color: #F8FAFC; padding: 14px 14px 72px; max-width: 540px; margin: 0 auto; }}
+  .top-bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
+  h1 {{ font-size: 1.25rem; color: #38BDF8; letter-spacing: 0.2px; }}
+  .ver-pill {{ background: #172554; color: #7DD3FC; border: 1px solid #1D4ED8; border-radius: 999px; padding: 3px 10px; font-size: 0.75rem; font-weight: 700; }}
+  .status-strip {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }}
+  .pill {{ display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 999px; font-size: 0.76rem; font-weight: 600; background: #151F32; border: 1px solid #22324F; color: #CBD5E1; }}
+  .pill-ok {{ border-color: #065F46; color: #34D399; background: #06281E; }}
+  .pill-warn {{ border-color: #92400E; color: #FBBF24; background: #2A1906; }}
+  .pill-err {{ border-color: #991B1B; color: #FCA5A5; background: #2A0A0A; }}
+  .card {{ background: #111A2C; border-radius: 14px; padding: 14px; margin-bottom: 12px; border: 1px solid #1E2E4A; }}
+  .card h2 {{ font-size: 0.78rem; margin-bottom: 10px; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.8px; display: flex; justify-content: space-between; align-items: center; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
+  .stat-box {{ background: #0B1220; border: 1px solid #1C2A44; border-radius: 10px; padding: 8px 10px; }}
+  .stat-k {{ font-size: 0.68rem; color: #64748B; text-transform: uppercase; font-weight: 700; }}
+  .stat-v {{ font-size: 1.02rem; font-weight: 700; color: #F8FAFC; margin-top: 2px; }}
+  .stat-s {{ font-size: 0.7rem; color: #94A3B8; margin-top: 1px; }}
+  .svc-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }}
+  .svc-chip {{ padding: 3px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; background: #0B1220; border: 1px solid #1E293B; color: #94A3B8; }}
+  .svc-on {{ color: #34D399; border-color: #065F46; background: #072219; }}
+  .svc-off {{ color: #FCA5A5; border-color: #991B1B; background: #260B0B; }}
+  button, input, select {{ width: 100%; padding: 10px 12px; border-radius: 9px; border: none; font-size: 0.92rem; margin-top: 6px; }}
+  input, select {{ background: #09111E; color: #F8FAFC; border: 1px solid #334155; }}
+  button {{ background: #0284C7; color: #FFFFFF; font-weight: 600; cursor: pointer; transition: transform 0.1s, opacity 0.15s; }}
+  button:active {{ transform: scale(0.97); }}
   .btn-row {{ display: flex; gap: 8px; margin-top: 6px; }}
-  .btn-row button {{ flex: 1; }}
-  .btn-amber {{ background: #D97706; }}
-  .btn-green {{ background: #059669; }}
-  .btn-red {{ background: #DC2626; }}
-  .status-badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; background: #0369A1; }}
+  .btn-row button, .btn-row select, .btn-row input {{ flex: 1; margin-top: 0; }}
+  .page-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }}
+  .page-grid button {{ margin-top: 0; background: #16243D; border: 1px solid #263B61; color: #E2E8F0; }}
+  .page-grid button.active {{ background: #0284C7; border-color: #38BDF8; color: #FFFFFF; }}
+  .btn-amber {{ background: #D97706 !important; border-color: #F59E0B !important; }}
+  .btn-green {{ background: #059669 !important; border-color: #10B981 !important; }}
+  .btn-red {{ background: #DC2626 !important; border-color: #EF4444 !important; }}
+  .btn-muted {{ background: #1E293B !important; color: #CBD5E1 !important; }}
+  .range-wrap {{ display: flex; align-items: center; gap: 10px; margin-top: 6px; }}
+  input[type=range] {{ flex: 1; padding: 0; height: 8px; accent-color: #38BDF8; background: transparent; border: none; }}
+  .links-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }}
+  .link-btn {{ display: block; text-align: center; text-decoration: none; padding: 10px; border-radius: 9px; background: #0B1220; border: 1px solid #22324F; color: #7DD3FC; font-weight: 600; font-size: 0.86rem; }}
+  #toast {{ position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #0F172A; color: #38BDF8; border: 1px solid #38BDF8; padding: 9px 16px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 99; max-width: 90%; text-align: center; }}
+  #toast.show {{ opacity: 1; }}
 </style>
 </head>
 <body>
-  <h1>Dashboard Remote Control</h1>
-  <div style="margin-bottom: 12px;"><span class="status-badge">Connected to Server</span></div>
-
-  <div class="card">
-    <h2>Send Banner Message</h2>
-    <input type="text" id="msgText" placeholder="e.g. Dinner is ready!" />
-    <button onclick="sendMsg()">Show on Display</button>
+  <div class="top-bar">
+    <h1>Wall Dashboard Remote</h1>
+    <span class="ver-pill">v{DASHBOARD_VERSION}</span>
+  </div>
+  <div class="status-strip">
+    <span id="pSlide" class="pill pill-ok">Slide: --</span>
+    <span id="pSec" class="pill">Sec Cam: --</span>
+    <span id="pNet" class="pill">Net: --</span>
   </div>
 
   <div class="card">
-    <h2>Page Switcher</h2>
-    <div class="btn-row">
-      <button onclick="setPage(0)">Main</button>
-      <button onclick="setPage(1)">Weather</button>
+    <h2>Live Telemetry <span id="stUpdated" style="color:#38BDF8;font-size:0.72rem;">Syncing...</span></h2>
+    <div class="stat-grid">
+      <div class="stat-box"><div class="stat-k">Weather</div><div class="stat-v" id="stTemp">--</div><div class="stat-s" id="stCond">--</div></div>
+      <div class="stat-box"><div class="stat-k">CPU / Temp</div><div class="stat-v" id="stCpu">--</div><div class="stat-s" id="stTempC">--</div></div>
+      <div class="stat-box"><div class="stat-k">RAM / Disk</div><div class="stat-v" id="stRam">--</div><div class="stat-s" id="stDisk">--</div></div>
+      <div class="stat-box"><div class="stat-k">Bandwidth</div><div class="stat-v" id="stRx">--</div><div class="stat-s" id="stTx">--</div></div>
+      <div class="stat-box"><div class="stat-k">AdGuard</div><div class="stat-v" id="stAds">--</div><div class="stat-s" id="stAdsPct">--</div></div>
+      <div class="stat-box"><div class="stat-k">Uptime</div><div class="stat-v" id="stUp">--</div><div class="stat-s" id="stUsb">--</div></div>
     </div>
-    <div class="btn-row">
-      <button onclick="setPage(2)">System</button>
-      <button onclick="setPage(3)">Money</button>
-    </div>
-    <div class="btn-row">
-      <button class="btn-amber" onclick="setPage(4)">Sky Dome</button>
-      <button class="btn-green" onclick="setPage(5)">Flight Radar</button>
-    </div>
-    <button style="margin-top:8px;" onclick="setPage(6)">Server Photos</button>
+    <div class="svc-row" id="svcRow"></div>
   </div>
 
   <div class="card">
-    <h2>Slideshow & Display</h2>
-    <div class="btn-row">
+    <h2>Slide Switcher <span id="rotState" style="color:#FBBF24;font-size:0.72rem;"></span></h2>
+    <div class="page-grid">
+      <button id="pg0" onclick="setPage(0)">1. Main</button>
+      <button id="pg1" onclick="setPage(1)">2. Weather</button>
+      <button id="pg2" onclick="setPage(2)">3. System</button>
+      <button id="pg3" onclick="setPage(3)">4. Money</button>
+      <button id="pg4" onclick="setPage(4)">5. Sky Dome</button>
+      <button id="pg5" onclick="setPage(5)">6. Flight Radar</button>
+      <button id="pg6" style="grid-column: span 2;" onclick="setPage(6)">7. Server Photos Gallery</button>
+    </div>
+    <div class="btn-row" style="margin-top:8px;">
+      <button class="btn-muted" onclick="stepPage(-1)">&lt; Prev</button>
       <button class="btn-amber" onclick="skipPhoto()">Next Photo</button>
-      <button onclick="togglePause()">Pause Rotation</button>
+      <button id="btnPause" onclick="togglePause()">Pause</button>
+      <button class="btn-muted" onclick="stepPage(1)">Next &gt;</button>
     </div>
-    <button class="btn-green" style="margin-top:8px;" onclick="toggleMap()">Open / Close Flight Map</button>
-    <button class="btn-amber" style="margin-top:8px;" onclick="toggleSky()">Open / Close Sky &amp; ISS Dome</button>
   </div>
 
   <div class="card">
-    <h2>Countdown Timer</h2>
-    <div class="btn-row">
-      <button onclick="setTimer(300)">5 Mins</button>
-      <button onclick="setTimer(600)">10 Mins</button>
-      <button onclick="setTimer(900)">15 Mins</button>
+    <h2>Banner Message</h2>
+    <input type="text" id="msgText" placeholder="e.g. Dinner is ready!" />
+    <div class="btn-row" style="margin-top:8px;">
+      <select id="msgDur">
+        <option value="30">30 sec</option>
+        <option value="60" selected>1 min</option>
+        <option value="300">5 mins</option>
+        <option value="900">15 mins</option>
+      </select>
+      <button onclick="sendMsg()">Show</button>
+      <button class="btn-muted" onclick="clearMsg()">Clear</button>
     </div>
-    <button class="btn-red" style="margin-top:8px;" onclick="cancelTimer()">Cancel Timer</button>
   </div>
 
   <div class="card">
-    <h2>Brightness Control</h2>
-    <div class="btn-row">
-      <button onclick="setBrightness(1.0)">100%</button>
-      <button onclick="setBrightness(0.8)">80%</button>
-      <button onclick="setBrightness(0.5)">50%</button>
+    <h2>Display, Theme &amp; Brightness <span id="briLbl" style="color:#38BDF8;">100%</span></h2>
+    <div class="range-wrap">
+      <span style="font-size:0.8rem;color:#94A3B8;">20%</span>
+      <input type="range" id="briSlider" min="20" max="100" step="5" value="100" oninput="document.getElementById('briLbl').textContent=this.value+'%'" onchange="setBrightness(this.value/100)" />
+      <span style="font-size:0.8rem;color:#94A3B8;">100%</span>
+    </div>
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn-muted" onclick="setTheme('auto')">Auto</button>
+      <button class="btn-muted" onclick="setTheme('day')">Day</button>
+      <button class="btn-muted" onclick="setTheme('evening')">Evening</button>
+      <button class="btn-muted" onclick="setTheme('night')">Night</button>
+      <button class="btn-muted" onclick="setTheme('oled')">OLED</button>
+    </div>
+    <div class="btn-row" style="margin-top:8px;">
+      <button class="btn-muted" onclick="toggleTimeFmt()">Toggle 12h / 24h</button>
+      <button class="btn-green" onclick="toggleMap()">Flight Map</button>
+      <button class="btn-amber" onclick="toggleSky()">Sky Dome</button>
     </div>
   </div>
+
+  <div class="card">
+    <h2>Countdown Timer <span id="tmrLbl" style="color:#FBBF24;"></span></h2>
+    <div class="btn-row">
+      <button onclick="setTimer(60)">1m</button>
+      <button onclick="setTimer(300)">5m</button>
+      <button onclick="setTimer(600)">10m</button>
+      <button onclick="setTimer(900)">15m</button>
+      <button onclick="setTimer(1800)">30m</button>
+    </div>
+    <div class="btn-row" style="margin-top:8px;">
+      <input type="number" id="customMin" min="1" max="180" placeholder="Custom mins" />
+      <button onclick="setCustomTimer()">Start</button>
+      <button class="btn-red" onclick="cancelTimer()">Cancel</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Server Apps</h2>
+    <div class="links-grid">
+      <a class="link-btn" id="lnkFb" target="_blank">FileBrowser (:8080)</a>
+      <a class="link-btn" id="lnkCp" target="_blank">Copyparty (:3923)</a>
+      <a class="link-btn" id="lnkAg" target="_blank">AdGuard Home (:8081)</a>
+      <a class="link-btn" id="lnkCk" target="_blank">Cockpit HUD (:9090)</a>
+    </div>
+  </div>
+
+  <div id="toast"></div>
 
 <script>
   const token = "{token}";
+  const host = window.location.hostname || "192.168.1.100";
+  document.getElementById("lnkFb").href = "http://" + host + ":8080/";
+  document.getElementById("lnkCp").href = "http://" + host + ":3923/";
+  document.getElementById("lnkAg").href = "http://" + host + ":8081/";
+  document.getElementById("lnkCk").href = "https://" + host + ":9090/";
+
+  let toastT = null;
+  function showToast(msg) {{
+    const el = document.getElementById("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastT);
+    toastT = setTimeout(() => el.classList.remove("show"), 2200);
+  }}
   function postApi(endpoint, data) {{
-    fetch('/api/' + endpoint + '?token=' + token, {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify(data)
-    }}).then(r => r.json()).then(res => alert(res.status || 'Done'));
+    fetch("/api/" + endpoint + "?token=" + encodeURIComponent(token), {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify(data || {{}})
+    }}).then(r => r.json()).then(res => {{
+      showToast(res.status || res.error || "Done");
+      setTimeout(refreshStatus, 350);
+    }}).catch(() => showToast("Connection error"));
   }}
   function sendMsg() {{
-    const val = document.getElementById('msgText').value;
-    if(val) postApi('message', {{text: val, duration: 60}});
+    const val = document.getElementById("msgText").value.trim();
+    const dur = parseInt(document.getElementById("msgDur").value || "60", 10);
+    if (val) postApi("message", {{text: val, duration: dur}});
   }}
-  function setPage(n) {{ postApi('page', {{page: n}}); }}
-  function skipPhoto() {{ postApi('photo/skip', {{}}); }}
-  function togglePause() {{ postApi('rotate/toggle', {{}}); }}
-  function toggleMap() {{ postApi('flights/toggle', {{}}); }}
-  function toggleSky() {{ postApi('sky/toggle', {{}}); }}
-  function setTimer(secs) {{ postApi('timer', {{seconds: secs}}); }}
-  function cancelTimer() {{ postApi('timer/cancel', {{}}); }}
-  function setBrightness(b) {{ postApi('brightness', {{level: b}}); }}
+  function clearMsg() {{ postApi("message/clear", {{}}); }}
+  function setPage(n) {{ postApi("page", {{page: n}}); }}
+  function stepPage(d) {{ postApi("page/step", {{delta: d}}); }}
+  function skipPhoto() {{ postApi("photo/skip", {{}}); }}
+  function togglePause() {{ postApi("rotate/toggle", {{}}); }}
+  function toggleMap() {{ postApi("flights/toggle", {{}}); }}
+  function toggleSky() {{ postApi("sky/toggle", {{}}); }}
+  function toggleTimeFmt() {{ postApi("time_format", {{}}); }}
+  function setTheme(t) {{ postApi("theme", {{theme: t}}); }}
+  function setTimer(secs) {{ postApi("timer", {{seconds: secs}}); }}
+  function setCustomTimer() {{
+    const m = parseInt(document.getElementById("customMin").value || "0", 10);
+    if (m > 0) setTimer(m * 60);
+  }}
+  function cancelTimer() {{ postApi("timer/cancel", {{}}); }}
+  function setBrightness(b) {{ postApi("brightness", {{level: b}}); }}
+
+  function refreshStatus() {{
+    fetch("/api/status?token=" + encodeURIComponent(token))
+      .then(r => r.json())
+      .then(d => {{
+        const s = d.system || {{}};
+        const w = d.weather || {{}};
+        document.getElementById("pSlide").textContent = "Slide: " + d.active_page_name + (d.rotation_paused ? " [PAUSED]" : "");
+        const pSec = document.getElementById("pSec");
+        pSec.textContent = s.security_armed ? "Sec Cam: ARMED" : ("Sec Cam: Standby (" + (s.security_events || 0) + ")");
+        pSec.className = "pill " + (s.security_armed ? "pill-err" : "pill-ok");
+        const pNet = document.getElementById("pNet");
+        pNet.textContent = "Inet: " + (s.inet_ping || "--") + " | " + (s.lan_ip || "");
+        pNet.className = "pill " + (s.inet_ping === "Offline" ? "pill-err" : "pill-ok");
+
+        document.getElementById("stTemp").textContent = w.temp || "--";
+        document.getElementById("stCond").textContent = (w.cond || "--") + " | Rain " + (w.rain_chance || "--");
+        document.getElementById("stCpu").textContent = (s.cpu_percent != null ? s.cpu_percent : "--") + "%";
+        document.getElementById("stTempC").textContent = (s.cpu_temp != null ? s.cpu_temp : "--") + " C | Load " + (s.load_avg || "--");
+        document.getElementById("stRam").textContent = (s.ram_percent != null ? s.ram_percent : "--") + "% RAM";
+        document.getElementById("stDisk").textContent = (s.disk_free_gb != null ? s.disk_free_gb : "--") + " GB free";
+        document.getElementById("stRx").textContent = "DN " + (s.net_rx || "--");
+        document.getElementById("stTx").textContent = "UP " + (s.net_tx || "--");
+        document.getElementById("stAds").textContent = s.ads_blocked || "--";
+        document.getElementById("stAdsPct").textContent = (s.ads_percent || "--") + " of " + (s.dns_queries || "--");
+        document.getElementById("stUp").textContent = s.uptime_str || "--";
+        document.getElementById("stUsb").textContent = s.usb_status || "USB: --";
+        document.getElementById("stUpdated").textContent = "Live " + new Date().toLocaleTimeString();
+
+        for (let i = 0; i < 7; i++) {{
+          const btn = document.getElementById("pg" + i);
+          if (btn) btn.classList.toggle("active", i === d.active_page);
+        }}
+        document.getElementById("rotState").textContent = d.rotation_paused ? "PAUSED" : "AUTO";
+        document.getElementById("btnPause").textContent = d.rotation_paused ? "Resume" : "Pause";
+        const briPct = Math.round((d.brightness || 1.0) * 100);
+        document.getElementById("briSlider").value = briPct;
+        document.getElementById("briLbl").textContent = briPct + "%";
+        if (d.timer_remaining !== null && d.timer_remaining !== undefined) {{
+          const mm = Math.floor(d.timer_remaining / 60);
+          const ss = d.timer_remaining % 60;
+          document.getElementById("tmrLbl").textContent = String(mm).padStart(2, "0") + ":" + String(ss).padStart(2, "0");
+        }} else {{
+          document.getElementById("tmrLbl").textContent = "";
+        }}
+
+        const row = document.getElementById("svcRow");
+        const svcs = s.services || {{}};
+        row.innerHTML = Object.keys(svcs).map(k => {{
+          const ok = svcs[k];
+          return '<span class="svc-chip ' + (ok ? 'svc-on' : 'svc-off') + '">' + k + ' ' + (ok ? 'OK' : 'DOWN') + '</span>';
+        }}).join("");
+      }}).catch(() => {{}});
+  }}
+  refreshStatus();
+  setInterval(refreshStatus, 5000);
 </script>
 </body>
 </html>
@@ -1915,20 +2465,39 @@ class PhoneControlHandler(BaseHTTPRequestHandler):
         with STATE.lock:
             if endpoint == "message":
                 text = safe_tcl(data.get("text", ""))
-                dur = data.get("duration", 60)
+                dur = max(5, min(3600, int(data.get("duration", 60))))
                 STATE.user_message = text
                 STATE.user_message_until = time.time() + dur
                 resp = {"status": f"Banner displayed for {dur}s"}
+            elif endpoint == "message/clear":
+                STATE.user_message = None
+                STATE.user_message_until = 0
+                resp = {"status": "Banner cleared"}
             elif endpoint == "page":
                 p = max(0, min(6, int(data.get("page", 0))))
                 STATE.page_switch_req = p
-                resp = {"status": f"Switched to page {p}"}
+                resp = {"status": f"Switched to slide {p + 1}"}
+            elif endpoint == "page/step":
+                delta = int(data.get("delta", 1))
+                p = (STATE.active_page + delta) % 7
+                STATE.page_switch_req = p
+                resp = {"status": f"Switched to slide {p + 1}"}
+            elif endpoint == "theme":
+                th = str(data.get("theme", "auto")).lower()
+                if th in ("auto", "day", "evening", "night", "oled"):
+                    STATE.theme_switch_req = th
+                    resp = {"status": f"Theme set to {th.upper()}"}
+                else:
+                    resp = {"error": "Invalid theme"}
+            elif endpoint == "time_format":
+                STATE.time_fmt_toggle_req = True
+                resp = {"status": "Toggled 12h/24h format"}
             elif endpoint == "photo/skip":
                 STATE.skip_photo_requested = True
                 resp = {"status": "Photo skipped"}
             elif endpoint == "rotate/toggle":
                 STATE.rotation_paused = not STATE.rotation_paused
-                resp = {"status": f"Rotation paused: {STATE.rotation_paused}"}
+                resp = {"status": "Rotation paused" if STATE.rotation_paused else "Rotation resumed"}
             elif endpoint == "flights/toggle":
                 STATE.flight_map_toggle_req = True
                 resp = {"status": "Toggled flight map"}
@@ -1939,10 +2508,10 @@ class PhoneControlHandler(BaseHTTPRequestHandler):
                 STATE.sky_pass_cycle_req = True
                 resp = {"status": "Cycled ISS pass"}
             elif endpoint == "timer":
-                secs = int(data.get("seconds", 300))
+                secs = max(5, min(10800, int(data.get("seconds", 300))))
                 STATE.timer_seconds_remaining = secs
                 STATE.timer_is_ringing = False
-                resp = {"status": f"Timer set for {secs} seconds"}
+                resp = {"status": f"Timer started ({secs // 60}m {secs % 60}s)"}
             elif endpoint == "timer/cancel":
                 STATE.timer_seconds_remaining = None
                 STATE.timer_is_ringing = False
@@ -1962,7 +2531,7 @@ class PhoneControlHandler(BaseHTTPRequestHandler):
 def start_phone_server():
     port = CONFIG["phone_control"].get("port", 8765)
     try:
-        server = HTTPServer(("0.0.0.0", port), PhoneControlHandler)
+        server = _ThreadingHTTPServer(("0.0.0.0", port), PhoneControlHandler)
         log_msg(f"Phone control server running on port {port}")
         server.serve_forever()
     except Exception as e:
@@ -2100,7 +2669,7 @@ class WeatherChartCanvas(tk.Canvas):
         # Draw dots, temperatures, hour labels
         for x, y, p in coords:
             self.create_oval(x - 4, y - 4, x + 4, y + 4, fill=theme["accent"], outline=theme["card_bg"], width=2)
-            self.create_text(x, y - 12, text=f"{p['temp']}Â°", fill=theme["fg"], font=("DejaVu Sans", 10, "bold"))
+            self.create_text(x, y - 12, text=f"{p['temp']}°", fill=theme["fg"], font=("DejaVu Sans", 10, "bold"))
             self.create_text(x, self.height - 14, text=p["hour"], fill=theme["fg_sub"], font=("DejaVu Sans", 9))
 
 # ================= MAIN GUI APPLICATION =================
@@ -2226,7 +2795,7 @@ class DashboardApp:
         root.configure(bg="#000000", cursor="none")
 
         self.news_h = 86
-        self.header_h = 28
+        self.header_h = 30
         self.top_h = screen_h - self.news_h - self.header_h
         self.sidebar_w = 440
         self.right_w = screen_w - self.sidebar_w
@@ -2236,6 +2805,8 @@ class DashboardApp:
         self.key_hints_visible = False
         self.burn_shift_x = 0
         self.burn_shift_y = 0
+        self._themed_cards = []
+        self._themed_titles = []
 
         self.build_frames()
 
@@ -2247,6 +2818,8 @@ class DashboardApp:
         root.bind("<N>", lambda e: self.skip_photo())
         root.bind("<b>", lambda e: self.toggle_night_mode())
         root.bind("<B>", lambda e: self.toggle_night_mode())
+        root.bind("<t>", lambda e: self.cycle_theme())
+        root.bind("<T>", lambda e: self.cycle_theme())
         root.bind("<f>", lambda e: self.toggle_12_24h())
         root.bind("<F>", lambda e: self.toggle_12_24h())
         root.bind("<h>", lambda e: self.toggle_key_hints())
@@ -2273,7 +2846,7 @@ class DashboardApp:
         if CONFIG["phone_control"].get("enabled", True):
             threading.Thread(target=start_phone_server, daemon=True).start()
 
-        self.last_photo_change = time.time()
+        self.last_photo_change = 0.0
         self.last_page_change = time.time()
         self.active_photo_path = None
         self.tk_photo_cache = None
@@ -2312,22 +2885,54 @@ class DashboardApp:
         self.update_theme_and_brightness()
 
     def build_frames(self):
-        # 1. Header
-        self.header_frame = tk.Frame(self.root, bg="#070C16", width=self.screen_w, height=self.header_h)
+        # 1. Header + 2px Slide Cycle Progress Bar
+        self.header_frame = tk.Frame(self.root, bg="#070C16", width=self.screen_w, height=self.header_h - 2)
         self.header_frame.place(x=0, y=0)
         self.header_frame.pack_propagate(False)
+
+        self.lbl_sec_pill = tk.Label(
+            self.header_frame, text="", font=("DejaVu Sans", 8, "bold"),
+            bg="#991B1B", fg="#FFFFFF", padx=6, pady=0
+        )
 
         self.lbl_alert_banner = tk.Label(
             self.header_frame, text="", font=("DejaVu Sans", 10, "bold"),
             bg="#070C16", fg="#F87171", anchor="w"
         )
-        self.lbl_alert_banner.pack(side=tk.LEFT, padx=14)
+        self.lbl_alert_banner.pack(side=tk.LEFT, padx=(12, 8))
+
+        self.lbl_ver_pill = tk.Label(
+            self.header_frame, text=f"v{DASHBOARD_VERSION}", font=("DejaVu Sans", 8, "bold"),
+            bg="#172554", fg="#7DD3FC", padx=6, pady=0
+        )
+        self.lbl_ver_pill.pack(side=tk.RIGHT, padx=(6, 10), pady=4)
+
+        self.page_dots_frame = tk.Frame(self.header_frame, bg="#070C16")
+        self.page_dots_frame.pack(side=tk.RIGHT, padx=(6, 4))
+        self.page_dot_labels = []
+        for idx_dot in range(7):
+            dl = tk.Label(
+                self.page_dots_frame, text="\u25cf", font=("DejaVu Sans", 8),
+                bg="#070C16", fg="#334155", padx=2, cursor="hand2"
+            )
+            dl.pack(side=tk.LEFT)
+            dl.bind("<Button-1>", lambda e, p=idx_dot: self._on_dot_click(p))
+            self.page_dot_labels.append(dl)
 
         self.lbl_header_status = tk.Label(
             self.header_frame, text="", font=("DejaVu Sans", 9),
             bg="#070C16", fg="#94A3B8"
         )
-        self.lbl_header_status.pack(side=tk.RIGHT, padx=14)
+        self.lbl_header_status.pack(side=tk.RIGHT, padx=(8, 4))
+
+        self.cycle_progress_canvas = tk.Canvas(
+            self.root, width=self.screen_w, height=2,
+            bg="#0F172A", highlightthickness=0
+        )
+        self.cycle_progress_canvas.place(x=0, y=self.header_h - 2)
+        self._progress_bar_id = self.cycle_progress_canvas.create_rectangle(
+            0, 0, 0, 2, fill="#38BDF8", outline=""
+        )
 
         # 2. Main content container
         self.content_frame = tk.Frame(
@@ -2348,9 +2953,13 @@ class DashboardApp:
         )
         self.slideshow_canvas.place(x=self.sidebar_w, y=0)
 
+        self.photo_caption_bg_id = self.slideshow_canvas.create_rectangle(
+            10, self.top_h - 32, 170, self.top_h - 8,
+            fill="#070C16", outline="#1E293B", width=1
+        )
         self.photo_caption_id = self.slideshow_canvas.create_text(
-            15, self.top_h - 18, text="Random Photo", anchor="w",
-            fill="#CBD5E1", font=("DejaVu Sans", 10)
+            18, self.top_h - 20, text="Random Photo", anchor="w",
+            fill="#E2E8F0", font=("DejaVu Sans", 9, "bold")
         )
 
         self.build_clock_card()
@@ -2382,7 +2991,7 @@ class DashboardApp:
 
         # 4. Key Hints
         self.hint_bar = tk.Label(
-            self.root, text="[<-/->] Slide  [Space] Pause  [N] Next Photo  [P] Photos  [S] Sky  [M] Flight  [B] Night  [F] 12/24h  [Esc] Exit",
+            self.root, text="[<-/->] Slide  [Space] Pause  [N] Next Photo  [P] Photos  [S] Sky  [M] Flight  [T] Theme  [B] Night  [F] 12/24h  [Esc] Exit",
             font=("DejaVu Sans", 9), bg="#1E293B", fg="#E2E8F0"
         )
 
@@ -2414,7 +3023,7 @@ class DashboardApp:
         self.card_weather = tk.Frame(self.sidebar_frame, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.card_weather.place(x=14, y=154, width=self.sidebar_w - 28, height=172)
 
-        self.lbl_weather_temp = tk.Label(self.card_weather, text="--Â°C", font=("DejaVu Sans", 42, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_weather_temp = tk.Label(self.card_weather, text="--°C", font=("DejaVu Sans", 42, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_weather_temp.place(x=14, y=12)
 
         self.weather_icon = AnimatedWeatherIcon(self.card_weather, size=100, bg=self.theme["card_bg"])
@@ -2423,17 +3032,19 @@ class DashboardApp:
         self.lbl_weather_desc = tk.Label(self.card_weather, text="Loading...", font=("DejaVu Sans", 15, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
         self.lbl_weather_desc.place(x=16, y=72)
 
-        self.lbl_weather_feels = tk.Label(self.card_weather, text="Feels: --  â€¢  H: --  L: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_weather_feels = tk.Label(self.card_weather, text="Feels: --  •  H: --  L: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_weather_feels.place(x=16, y=104)
 
-        self.lbl_weather_extras = tk.Label(self.card_weather, text="Rain: --%  â€¢  Humidity: --%  â€¢  Wind: --", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_weather_extras = tk.Label(self.card_weather, text="Rain: --%  •  Humidity: --%  •  Wind: --", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_weather_extras.place(x=16, y=134)
 
     def build_event_card(self):
         self.card_event = tk.Frame(self.sidebar_frame, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.card_event.place(x=14, y=334, width=self.sidebar_w - 28, height=118)
 
-        tk.Label(self.card_event, text="UPCOMING EVENT & REMINDERS", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).place(x=14, y=8)
+        t_ev_main = tk.Label(self.card_event, text="UPCOMING EVENT & REMINDERS", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_ev_main.place(x=14, y=8)
+        self._themed_titles.append(t_ev_main)
 
         self.lbl_event_title = tk.Label(self.card_event, text="Checking calendar...", font=("DejaVu Sans", 13, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_event_title.place(x=14, y=36)
@@ -2511,7 +3122,7 @@ class DashboardApp:
         self.flight_hud.place(x=0, y=self.flight_map_h + 2)
 
         self.lbl_flight_badge = tk.Label(
-            self.flight_hud, text=safe_tcl("\u2708 OVERHEAD LOCAL"),
+            self.flight_hud, text=safe_tcl("\u2708 OVERHEAD HOME"),
             font=("DejaVu Sans", 9, "bold"), bg="#DC2626", fg="#FFFFFF", padx=8, pady=1
         )
         self.lbl_flight_badge.place(x=14, y=8)
@@ -2561,17 +3172,23 @@ class DashboardApp:
 
     # ---------------- PAGE 2: WEATHER DETAIL ----------------
     def build_page_weather(self):
-        card_chart = tk.Frame(self.page_weather, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_chart.place(x=14, y=8, width=self.screen_w - 28, height=220)
+        self.card_chart = tk.Frame(self.page_weather, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_chart.place(x=14, y=8, width=self.screen_w - 28, height=220)
+        self._themed_cards.append(self.card_chart)
 
-        tk.Label(card_chart, text="12-HOUR FORECAST & PRECIPITATION CHANCE", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=16, pady=(8, 0))
+        t_ch = tk.Label(self.card_chart, text="12-HOUR FORECAST & PRECIPITATION CHANCE", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_ch.pack(anchor="w", padx=16, pady=(8, 0))
+        self._themed_titles.append(t_ch)
 
-        self.hourly_canvas = WeatherChartCanvas(card_chart, width=self.screen_w - 60, height=180, bg=self.theme["card_bg"])
+        self.hourly_canvas = WeatherChartCanvas(self.card_chart, width=self.screen_w - 60, height=180, bg=self.theme["card_bg"])
         self.hourly_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
         self.card_5day = tk.Frame(self.page_weather, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.card_5day.place(x=14, y=236, width=540, height=216)
-        tk.Label(self.card_5day, text="5-DAY OUTLOOK", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self._themed_cards.append(self.card_5day)
+        t_5d = tk.Label(self.card_5day, text="5-DAY OUTLOOK", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_5d.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_5d)
 
         self.daily_labels = []
         for i in range(5):
@@ -2579,24 +3196,27 @@ class DashboardApp:
             row.pack(fill=tk.X, padx=14, pady=3)
             lbl_d = tk.Label(row, text="--", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"], width=8, anchor="w")
             lbl_d.pack(side=tk.LEFT)
-            lbl_t = tk.Label(row, text="--Â° / --Â°", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["accent"], anchor="e")
+            lbl_t = tk.Label(row, text="--° / --°", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["accent"], anchor="e")
             lbl_t.pack(side=tk.RIGHT)
             self.daily_labels.append((lbl_d, lbl_t))
 
         self.card_metrics = tk.Frame(self.page_weather, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.card_metrics.place(x=568, y=236, width=self.screen_w - 582, height=216)
-        tk.Label(self.card_metrics, text="CONDITIONS & ASTRONOMY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self._themed_cards.append(self.card_metrics)
+        t_mt = tk.Label(self.card_metrics, text="CONDITIONS & ASTRONOMY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_mt.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_mt)
 
-        self.lbl_p2_uv_aqi = tk.Label(self.card_metrics, text="UV Index: --  â€¢  AQI: --", font=("DejaVu Sans", 12), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_p2_uv_aqi = tk.Label(self.card_metrics, text="UV Index: --  •  AQI: --", font=("DejaVu Sans", 12), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_p2_uv_aqi.pack(anchor="w", padx=14, pady=4)
 
-        self.lbl_p2_sun = tk.Label(self.card_metrics, text="Sunrise: --  â€¢  Sunset: --", font=("DejaVu Sans", 12), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_p2_sun = tk.Label(self.card_metrics, text="Sunrise: --  •  Sunset: --", font=("DejaVu Sans", 12), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_p2_sun.pack(anchor="w", padx=14, pady=4)
 
         self.lbl_p2_moon = tk.Label(self.card_metrics, text="Moon: Calculating...", font=("DejaVu Sans", 12), bg=self.theme["card_bg"], fg=self.theme["accent"])
         self.lbl_p2_moon.pack(anchor="w", padx=14, pady=4)
 
-        self.lbl_p2_wind_hum = tk.Label(self.card_metrics, text="Wind: --  â€¢  Humidity: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_p2_wind_hum = tk.Label(self.card_metrics, text="Wind: --  •  Humidity: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_p2_wind_hum.pack(anchor="w", padx=14, pady=4)
 
     # ---------------- PAGE 3: HOME & SYSTEM ----------------
@@ -2606,59 +3226,94 @@ class DashboardApp:
 
         self.c_cpu = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_cpu.place(x=14, y=8, width=cw, height=ch)
-        tk.Label(self.c_cpu, text="CPU LOAD & TEMP", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
+        self._themed_cards.append(self.c_cpu)
+        t_cpu = tk.Label(self.c_cpu, text="CPU LOAD & TEMP", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_cpu.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_cpu)
         self.lbl_sys_cpu = tk.Label(self.c_cpu, text="--%", font=("DejaVu Sans", 24, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_sys_cpu.pack(anchor="w", padx=12)
-        self.lbl_sys_temp = tk.Label(self.c_cpu, text="Temp: --Â°C", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_temp = tk.Label(self.c_cpu, text="Temp: --\u00b0C  \u2022  Load: --", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_sys_temp.pack(anchor="w", padx=12, pady=2)
 
         self.c_ram = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_ram.place(x=14 + cw + 7, y=8, width=cw, height=ch)
-        tk.Label(self.c_ram, text="MEMORY (RAM)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
+        self._themed_cards.append(self.c_ram)
+        t_ram = tk.Label(self.c_ram, text="MEMORY (RAM)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_ram.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_ram)
         self.lbl_sys_ram = tk.Label(self.c_ram, text="--%", font=("DejaVu Sans", 24, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_sys_ram.pack(anchor="w", padx=12)
-        self.lbl_sys_ram_sub = tk.Label(self.c_ram, text="-- MB used / -- MB", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_ram_sub = tk.Label(self.c_ram, text="-- MB used / -- MB", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_sys_ram_sub.pack(anchor="w", padx=12, pady=2)
 
         self.c_disk = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_disk.place(x=14 + 2 * (cw + 7), y=8, width=cw, height=ch)
-        tk.Label(self.c_disk, text="DISK STORAGE", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
-        self.lbl_sys_disk = tk.Label(self.c_disk, text="--%", font=("DejaVu Sans", 24, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self._themed_cards.append(self.c_disk)
+        t_dsk = tk.Label(self.c_disk, text="DISK & USB STORAGE", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_dsk.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_dsk)
+        self.lbl_sys_disk = tk.Label(self.c_disk, text="--%", font=("DejaVu Sans", 22, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_sys_disk.pack(anchor="w", padx=12)
-        self.lbl_sys_disk_sub = tk.Label(self.c_disk, text="-- GB Free", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
-        self.lbl_sys_disk_sub.pack(anchor="w", padx=12, pady=2)
+        self.lbl_sys_disk_sub = tk.Label(self.c_disk, text="-- GB Free", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_disk_sub.pack(anchor="w", padx=12)
+        self.lbl_sys_usb = tk.Label(self.c_disk, text="USB: Not mounted", font=("DejaVu Sans", 9, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_usb.pack(anchor="w", padx=12, pady=1)
 
         self.c_net = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_net.place(x=14, y=156, width=cw, height=ch)
-        tk.Label(self.c_net, text="NETWORK & PING", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
-        self.lbl_sys_net = tk.Label(self.c_net, text="Inet: --", font=("DejaVu Sans", 15, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self._themed_cards.append(self.c_net)
+        t_net = tk.Label(self.c_net, text="NETWORK & BANDWIDTH", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_net.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_net)
+        self.lbl_sys_net = tk.Label(self.c_net, text="Inet: --", font=("DejaVu Sans", 14, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_sys_net.pack(anchor="w", padx=12)
-        self.lbl_sys_net_sub = tk.Label(self.c_net, text="Router (192.168.1.1): --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
-        self.lbl_sys_net_sub.pack(anchor="w", padx=12, pady=2)
+        self.lbl_sys_net_sub = tk.Label(self.c_net, text="Router: --  \u2022  IP: --", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_net_sub.pack(anchor="w", padx=12, pady=1)
+        self.lbl_sys_bw = tk.Label(self.c_net, text="\u2193 0.0 KB/s   \u2191 0.0 KB/s", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg="#38BDF8")
+        self.lbl_sys_bw.pack(anchor="w", padx=12, pady=2)
 
         self.c_srv = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_srv.place(x=14 + cw + 7, y=156, width=cw, height=ch)
-        tk.Label(self.c_srv, text="SERVICES & TAILSCALE", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
-        self.lbl_sys_ts = tk.Label(self.c_srv, text="Tailscale: --", font=("DejaVu Sans", 14, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
-        self.lbl_sys_ts.pack(anchor="w", padx=12)
-        self.lbl_sys_docker = tk.Label(self.c_srv, text="Docker Containers: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
-        self.lbl_sys_docker.pack(anchor="w", padx=12, pady=2)
-        self.lbl_sys_adguard = tk.Label(self.c_srv, text="Ads Blocked: --", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg="#10B981")
+        self._themed_cards.append(self.c_srv)
+        t_srv = tk.Label(self.c_srv, text="SERVICES & SECURITY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_srv.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_srv)
+        self.svc_dots_frame = tk.Frame(self.c_srv, bg=self.theme["card_bg"])
+        self.svc_dots_frame.pack(anchor="w", padx=10, pady=2)
+        self.svc_chip_labels = {}
+        for lbl, _ in CORE_SERVICE_SPECS:
+            chip = tk.Label(
+                self.svc_dots_frame, text=f"\u25cf{lbl}", font=("DejaVu Sans", 8, "bold"),
+                bg=self.theme["card_bg"], fg="#64748B", padx=3
+            )
+            chip.pack(side=tk.LEFT)
+            self.svc_chip_labels[lbl] = chip
+        self.lbl_sys_adguard = tk.Label(self.c_srv, text="Ads Blocked: --", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg="#10B981")
         self.lbl_sys_adguard.pack(anchor="w", padx=12, pady=2)
+        self.lbl_sys_sec = tk.Label(self.c_srv, text="Sec: Standby", font=("DejaVu Sans", 9, "bold"), bg=self.theme["card_bg"], fg="#94A3B8", anchor="w")
+        self.lbl_sys_sec.pack(anchor="w", padx=12, pady=1)
 
         self.c_pwr = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
         self.c_pwr.place(x=14 + 2 * (cw + 7), y=156, width=cw, height=ch)
-        tk.Label(self.c_pwr, text="POWER & UPTIME", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=6)
-        self.lbl_sys_pwr = tk.Label(self.c_pwr, text="Power: --", font=("DejaVu Sans", 14, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self._themed_cards.append(self.c_pwr)
+        t_pwr = tk.Label(self.c_pwr, text="POWER & TAILSCALE", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_pwr.pack(anchor="w", padx=12, pady=(6, 2))
+        self._themed_titles.append(t_pwr)
+        self.lbl_sys_pwr = tk.Label(self.c_pwr, text="Power: --", font=("DejaVu Sans", 13, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_sys_pwr.pack(anchor="w", padx=12)
-        self.lbl_sys_uptime = tk.Label(self.c_pwr, text="Uptime: --", font=("DejaVu Sans", 11), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
-        self.lbl_sys_uptime.pack(anchor="w", padx=12, pady=2)
+        self.lbl_sys_uptime = tk.Label(self.c_pwr, text="Uptime: --", font=("DejaVu Sans", 10), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_uptime.pack(anchor="w", padx=12, pady=1)
+        self.lbl_sys_ts = tk.Label(self.c_pwr, text="Tailscale: --", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_sys_ts.pack(anchor="w", padx=12, pady=2)
 
-        card_hist = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_hist.place(x=14, y=304, width=self.screen_w - 28, height=148)
-        tk.Label(card_hist, text="RESOURCE HISTORY (BLUE: CPU, GREEN: RAM)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=12, pady=4)
+        self.card_hist = tk.Frame(self.page_system, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_hist.place(x=14, y=304, width=self.screen_w - 28, height=148)
+        self._themed_cards.append(self.card_hist)
+        t_hist = tk.Label(self.card_hist, text="RESOURCE HISTORY  (CYAN: CPU  \u2022  GREEN: RAM  \u2022  AMBER: NET)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_hist.pack(anchor="w", padx=12, pady=4)
+        self._themed_titles.append(t_hist)
 
-        self.sys_sparkline = tk.Canvas(card_hist, width=self.screen_w - 60, height=110, bg=self.theme["card_bg"], highlightthickness=0)
+        self.sys_sparkline = tk.Canvas(self.card_hist, width=self.screen_w - 60, height=110, bg=self.theme["card_bg"], highlightthickness=0)
         self.sys_sparkline.pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
 
     # ---------------- PAGE 4: MONEY & DAY ----------------
@@ -2666,47 +3321,59 @@ class DashboardApp:
         cw = (self.screen_w - 35) // 2
         ch = 210
 
-        card_rates = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_rates.place(x=14, y=8, width=cw, height=ch)
-        tk.Label(card_rates, text="LIVE CURRENCY EXCHANGE (INR)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self.card_rates = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_rates.place(x=14, y=8, width=cw, height=ch)
+        self._themed_cards.append(self.card_rates)
+        t_rt = tk.Label(self.card_rates, text="LIVE CURRENCY EXCHANGE (INR)", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_rt.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_rt)
 
-        self.lbl_rate_usd = tk.Label(card_rates, text="1 USD = Rs.--", font=("DejaVu Sans", 16, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_rate_usd = tk.Label(self.card_rates, text="1 USD = Rs.--", font=("DejaVu Sans", 16, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_rate_usd.pack(anchor="w", padx=14, pady=4)
-        self.lbl_rate_eur = tk.Label(card_rates, text="1 EUR = Rs.--", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_rate_eur = tk.Label(self.card_rates, text="1 EUR = Rs.--", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_rate_eur.pack(anchor="w", padx=14, pady=4)
-        self.lbl_rate_gbp = tk.Label(card_rates, text="1 GBP = Rs.--", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_rate_gbp = tk.Label(self.card_rates, text="1 GBP = Rs.--", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_rate_gbp.pack(anchor="w", padx=14, pady=4)
-        self.lbl_rate_sub = tk.Label(card_rates, text="Source: open.er-api.com", font=("DejaVu Sans", 9), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
+        self.lbl_rate_sub = tk.Label(self.card_rates, text="Source: open.er-api.com", font=("DejaVu Sans", 9), bg=self.theme["card_bg"], fg=self.theme["fg_sub"])
         self.lbl_rate_sub.pack(anchor="w", padx=14, pady=4)
 
-        card_day = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_day.place(x=14 + cw + 7, y=8, width=cw, height=ch)
-        tk.Label(card_day, text="DAY & ASTRONOMY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self.card_day = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_day.place(x=14 + cw + 7, y=8, width=cw, height=ch)
+        self._themed_cards.append(self.card_day)
+        t_dy = tk.Label(self.card_day, text="DAY & ASTRONOMY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_dy.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_dy)
 
-        self.lbl_day_of_year = tk.Label(card_day, text="Day -- of 365", font=("DejaVu Sans", 16, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_day_of_year = tk.Label(self.card_day, text="Day -- of 365", font=("DejaVu Sans", 16, "bold"), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_day_of_year.pack(anchor="w", padx=14, pady=4)
-        self.lbl_week_num = tk.Label(card_day, text="Week --", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
+        self.lbl_week_num = tk.Label(self.card_day, text="Week --", font=("DejaVu Sans", 14), bg=self.theme["card_bg"], fg=self.theme["fg"])
         self.lbl_week_num.pack(anchor="w", padx=14, pady=4)
-        self.lbl_moon_info = tk.Label(card_day, text="Moon: --", font=("DejaVu Sans", 14, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        self.lbl_moon_info = tk.Label(self.card_day, text="Moon: --", font=("DejaVu Sans", 14, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
         self.lbl_moon_info.pack(anchor="w", padx=14, pady=4)
 
-        card_quote = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_quote.place(x=14, y=226, width=cw, height=ch)
-        tk.Label(card_quote, text="THOUGHT FOR TODAY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self.card_quote = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_quote.place(x=14, y=226, width=cw, height=ch)
+        self._themed_cards.append(self.card_quote)
+        t_qt = tk.Label(self.card_quote, text="THOUGHT FOR TODAY", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_qt.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_qt)
 
         self.lbl_quote_text = tk.Label(
-            card_quote, text="Loading daily quote...", font=("DejaVu Sans", 12, "italic"),
+            self.card_quote, text="Loading daily quote...", font=("DejaVu Sans", 12, "italic"),
             bg=self.theme["card_bg"], fg=self.theme["fg"], wraplength=cw - 30, justify="left"
         )
         self.lbl_quote_text.pack(anchor="w", padx=14, pady=6)
-        self.lbl_quote_author = tk.Label(card_quote, text="â€” Author", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        self.lbl_quote_author = tk.Label(self.card_quote, text="— Author", font=("DejaVu Sans", 11, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
         self.lbl_quote_author.pack(anchor="e", padx=14, pady=4)
 
-        card_ev_p4 = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
-        card_ev_p4.place(x=14 + cw + 7, y=226, width=cw, height=ch)
-        tk.Label(card_ev_p4, text="TAMIL NADU & NATIONAL FESTIVALS", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"]).pack(anchor="w", padx=14, pady=8)
+        self.card_ev_p4 = tk.Frame(self.page_money, bg=self.theme["card_bg"], bd=1, highlightbackground=self.theme["card_border"], highlightthickness=1)
+        self.card_ev_p4.place(x=14 + cw + 7, y=226, width=cw, height=ch)
+        self._themed_cards.append(self.card_ev_p4)
+        t_ev = tk.Label(self.card_ev_p4, text="TAMIL NADU & NATIONAL FESTIVALS", font=("DejaVu Sans", 10, "bold"), bg=self.theme["card_bg"], fg=self.theme["accent"])
+        t_ev.pack(anchor="w", padx=14, pady=8)
+        self._themed_titles.append(t_ev)
 
-        self.p4_ev_container = tk.Frame(card_ev_p4, bg=self.theme["card_bg"])
+        self.p4_ev_container = tk.Frame(self.card_ev_p4, bg=self.theme["card_bg"])
         self.p4_ev_container.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
 
     # ================= PERIODIC GUI REFRESH METHODS =================
@@ -2741,6 +3408,8 @@ class DashboardApp:
         toggle_sky = False
         cycle_sky = False
         req_page = None
+        req_theme = None
+        req_time_fmt = False
         with STATE.lock:
             if STATE.flight_map_toggle_req:
                 toggle_map = True
@@ -2754,8 +3423,15 @@ class DashboardApp:
             if STATE.page_switch_req is not None:
                 req_page = STATE.page_switch_req
                 STATE.page_switch_req = None
+            if STATE.theme_switch_req is not None:
+                req_theme = STATE.theme_switch_req
+                STATE.theme_switch_req = None
+            if STATE.time_fmt_toggle_req:
+                req_time_fmt = True
+                STATE.time_fmt_toggle_req = False
             active_msg = None
             flight_hdr = None
+            sec_armed = bool(STATE.system.get("security_armed", False))
             if STATE.user_message and time.time() < STATE.user_message_until:
                 active_msg = safe_tcl(f"MESSAGE: {STATE.user_message}")
             elif STATE.alerts:
@@ -2770,6 +3446,18 @@ class DashboardApp:
                     rt = f" ({fl['orig_code']}\u2192{fl['dst_code']})"
                 flight_hdr = safe_tcl(f"\u2708 {code}{rt}  \u2022  {fl['dist_km']} km {fl['compass']}  \u2022  {fl['alt_ft']:,} ft")
 
+        if req_time_fmt:
+            self.toggle_12_24h()
+        if req_theme is not None:
+            CONFIG["theme"] = req_theme
+            if req_theme == "auto":
+                STATE.night_mode_active = False
+                self._apply_auto_theme_now()
+            else:
+                STATE.night_mode_active = (req_theme == "night")
+                self.apply_theme(req_theme)
+                if req_theme == "night":
+                    set_screen_brightness(CONFIG["night_mode"].get("brightness_night", 0.5))
         if req_page is not None:
             self.last_page_change = time.time()
             self._flight_auto_active = False
@@ -2785,16 +3473,26 @@ class DashboardApp:
             nxt = (self._sky_pinned_idx + 1) % max(1, len(passes[:3]))
             self.select_sky_pass(nxt)
 
-        if active_msg:
-            self.lbl_alert_banner.config(text=active_msg)
-            self.header_frame.config(bg="#991B1B" if "ALERT" in active_msg else "#0284C7")
-            self.lbl_alert_banner.config(bg=self.header_frame["bg"], fg="#FFFFFF")
-        elif flight_hdr:
-            self.header_frame.config(bg="#070C16")
-            self.lbl_alert_banner.config(text=flight_hdr, bg="#070C16", fg="#38BDF8")
+        if sec_armed:
+            self.lbl_sec_pill.config(text="\u25cf SEC ARMED", bg="#DC2626", fg="#FFFFFF")
+            if not self.lbl_sec_pill.winfo_ismapped():
+                self.lbl_sec_pill.pack(side=tk.LEFT, padx=(10, 0), pady=4, before=self.lbl_alert_banner)
         else:
-            self.header_frame.config(bg="#070C16")
-            self.lbl_alert_banner.config(text="", bg="#070C16")
+            if self.lbl_sec_pill.winfo_ismapped():
+                self.lbl_sec_pill.pack_forget()
+
+        hdr_bg = "#070C16"
+        if active_msg:
+            hdr_bg = "#991B1B" if "ALERT" in active_msg else "#0284C7"
+            self.lbl_alert_banner.config(text=active_msg, bg=hdr_bg, fg="#FFFFFF")
+        elif flight_hdr:
+            self.lbl_alert_banner.config(text=flight_hdr, bg=hdr_bg, fg="#38BDF8")
+        else:
+            self.lbl_alert_banner.config(text="", bg=hdr_bg)
+
+        self.header_frame.config(bg=hdr_bg)
+        self.page_dots_frame.config(bg=hdr_bg)
+        self.lbl_header_status.config(bg=hdr_bg, fg="#FFFFFF" if active_msg else "#94A3B8")
 
         page_names = ["Main", "Weather", "System", "Money", "Sky Dome", "Flight Radar", "Server Photos"]
         cur_p = page_names[STATE.active_page] if 0 <= STATE.active_page < len(page_names) else "Main"
@@ -2802,8 +3500,32 @@ class DashboardApp:
         with STATE.lock:
             ads_b = STATE.system.get("ads_blocked", "--")
             ads_p = STATE.system.get("ads_percent", "--")
-        ag_tag = f"Ads Blocked: {ads_b} ({ads_p})  â€¢  " if ads_b != "--" else ""
-        self.lbl_header_status.config(text=safe_tcl(f"{ag_tag}Page: {cur_p}{paused_tag}"))
+            ap_idx = STATE.active_page
+            is_paused = STATE.rotation_paused
+        for i_dot, dl in enumerate(self.page_dot_labels):
+            if active_msg:
+                inactive_col = "#5C1919" if "ALERT" in active_msg else "#075985"
+                dot_fg = "#FFFFFF" if i_dot == ap_idx else inactive_col
+            else:
+                dot_fg = self.theme["accent"] if i_dot == ap_idx else "#334155"
+            dl.config(bg=hdr_bg, fg=dot_fg)
+        ag_tag = f"Ads: {ads_b} ({ads_p})  \u2022  " if ads_b != "--" else ""
+        self.lbl_header_status.config(text=safe_tcl(f"{ag_tag}{cur_p}{paused_tag}"))
+
+        # Update 2px slide cycle progress bar
+        cycle_total = CONFIG.get("page_cycle_seconds", 180) if ap_idx == 0 else CONFIG.get("extra_page_display_seconds", 15)
+        if self._flight_auto_active:
+            bar_w = self.screen_w
+            bar_col = "#EF4444"
+        elif is_paused:
+            bar_w = self.screen_w
+            bar_col = "#F59E0B"
+        else:
+            frac = max(0.0, min(1.0, (time.time() - self.last_page_change) / float(max(1, cycle_total))))
+            bar_w = int(round(self.screen_w * frac))
+            bar_col = self.theme["accent"]
+        self.cycle_progress_canvas.coords(self._progress_bar_id, 0, 0, bar_w, 2)
+        self.cycle_progress_canvas.itemconfig(self._progress_bar_id, fill=bar_col)
 
         if STATE.timer_seconds_remaining is not None:
             if STATE.timer_seconds_remaining > 0:
@@ -2838,24 +3560,24 @@ class DashboardApp:
 
         self.lbl_weather_temp.config(text=safe_tcl(w["temp"]))
         self.lbl_weather_desc.config(text=safe_tcl(w["cond"]))
-        self.lbl_weather_feels.config(text=safe_tcl(f"Feels: {w['feels']}  â€¢  H: {w['temp_max']}  L: {w['temp_min']}"))
-        self.lbl_weather_extras.config(text=safe_tcl(f"Rain: {w['rain_chance']}  â€¢  Hum: {w['humidity']}  â€¢  Wind: {w['wind']}"))
+        self.lbl_weather_feels.config(text=safe_tcl(f"Feels: {w['feels']}  •  H: {w['temp_max']}  L: {w['temp_min']}"))
+        self.lbl_weather_extras.config(text=safe_tcl(f"Rain: {w['rain_chance']}  •  Hum: {w['humidity']}  •  Wind: {w['wind']}"))
 
         self.weather_icon.set_condition(w["icon_name"])
 
-        self.lbl_p2_uv_aqi.config(text=safe_tcl(f"UV Index: {w['uv']}  â€¢  AQI: {w['aqi']}"))
-        self.lbl_p2_sun.config(text=safe_tcl(f"Sunrise: {w['sunrise']}  â€¢  Sunset: {w['sunset']}"))
-        self.lbl_p2_wind_hum.config(text=safe_tcl(f"Wind Speed: {w['wind']}  â€¢  Humidity: {w['humidity']}"))
+        self.lbl_p2_uv_aqi.config(text=safe_tcl(f"UV Index: {w['uv']}  •  AQI: {w['aqi']}"))
+        self.lbl_p2_sun.config(text=safe_tcl(f"Sunrise: {w['sunrise']}  •  Sunset: {w['sunset']}"))
+        self.lbl_p2_wind_hum.config(text=safe_tcl(f"Wind Speed: {w['wind']}  •  Humidity: {w['humidity']}"))
 
         daily = w.get("daily", [])
         for idx, (lbl_d, lbl_t) in enumerate(self.daily_labels):
             if idx < len(daily):
                 d_item = daily[idx]
                 lbl_d.config(text=safe_tcl(d_item["day"]))
-                lbl_t.config(text=safe_tcl(f"{d_item['max']}Â° / {d_item['min']}Â°"))
+                lbl_t.config(text=safe_tcl(f"{d_item['max']}° / {d_item['min']}°"))
             else:
                 lbl_d.config(text="--")
-                lbl_t.config(text="--Â° / --Â°")
+                lbl_t.config(text="--° / --°")
 
         if STATE.active_page == 1:
             self.hourly_canvas.draw_chart(w.get("hourly", []), self.theme)
@@ -2886,10 +3608,10 @@ class DashboardApp:
         self.lbl_rate_usd.config(text=safe_tcl(f"1 USD = {fin['usd_inr']}"))
         self.lbl_rate_eur.config(text=safe_tcl(f"1 EUR = {fin['eur_inr']}"))
         self.lbl_rate_gbp.config(text=safe_tcl(f"1 GBP = {fin['gbp_inr']}"))
-        self.lbl_rate_sub.config(text=safe_tcl(f"Rates as of {fin['updated_time']} â€¢ open.er-api.com"))
+        self.lbl_rate_sub.config(text=safe_tcl(f"Rates as of {fin['updated_time']} • open.er-api.com"))
 
-        self.lbl_quote_text.config(text=safe_tcl(f"â€œ{q['text']}â€"))
-        self.lbl_quote_author.config(text=safe_tcl(f"â€” {q['author']}"))
+        self.lbl_quote_text.config(text=safe_tcl(f"“{q['text']}”"))
+        self.lbl_quote_author.config(text=safe_tcl(f"— {q['author']}"))
 
         self.update_system_page_ui()
         self.update_flight_display()
@@ -2936,7 +3658,7 @@ class DashboardApp:
         new_overhead = active_ov_hexes - self._seen_overhead_hexes
         self._seen_overhead_hexes = active_ov_hexes
 
-        # Auto-switch full screen to Page 5 whenever an aircraft enters 10 km Chennai radius
+        # Auto-switch full screen to Page 5 whenever an aircraft enters 10 km Local radius
         if new_overhead and not (new_overhead <= self.flight_map_dismissed_hexes):
             if cur_p != 5:
                 self._flight_auto_return_page = cur_p
@@ -3119,7 +3841,7 @@ class DashboardApp:
             if len(vis_passes) > 1:
                 peak_txt += f" ({st['sel_idx'] + 1}/{len(vis_passes)})"
         else:
-            title_txt = "Scanning ISS visible passes over Chennai (Chennai)..."
+            title_txt = "Scanning ISS visible passes over Chennai..."
             peak_txt = "Min Peak >= 25\u00b0"
 
         self.lbl_sky_title.config(text=safe_tcl(title_txt))
@@ -3132,7 +3854,7 @@ class DashboardApp:
             if len(first_m) > 28:
                 first_m = first_m[:27] + "."
             isro_tag = f"  \u2022  ISRO: {first_m}"
-        meta_txt = f"Sun: {st['sunrise']} - {st['sunset']}  \u2022  Moon: {m_name}  \u2022  10 km Chennai Radar{isro_tag}"
+        meta_txt = f"Sun: {st['sunrise']} - {st['sunset']}  \u2022  Moon: {m_name}  \u2022  10 km Local Radar{isro_tag}"
         self.lbl_sky_meta.config(text=safe_tcl(meta_txt))
 
     def _animate_sky_dome(self):
@@ -3160,7 +3882,7 @@ class DashboardApp:
         vis_passes = st["passes"]
         sel_idx = st["sel_idx"]
 
-        # Column 1 (left): Large All-Sky Stereographic Dome over Chennai
+        # Column 1 (left): Large All-Sky Stereographic Dome over Home
         cx, cy, R = 196, 194, 132
         c.create_oval(cx - R - 20, cy - R - 20, cx + R + 20, cy + R + 20, fill="#091326", outline="#1E3A5F", width=2)
 
@@ -3253,7 +3975,7 @@ class DashboardApp:
             self._last_sky_look_txt = look_txt
 
         # Top banner pills
-        top_txt = "\u25cf ISS OVERHEAD LOCAL (<= 1600 KM)" if st["is_live_overhead"] else "\u25cf LOCAL ALL-SKY & ISS DOME (13.08\u00b0N, 80.27\u00b0E)"
+        top_txt = "\u25cf ISS OVERHEAD HOME (<= 1600 KM)" if st["is_live_overhead"] else "\u25cf LOCAL ALL-SKY & ISS DOME (13.08\u00b0N, 80.27\u00b0E)"
         top_fg = "#FCA5A5" if st["is_live_overhead"] else "#FBBF24"
         self._draw_pill_label(c, 12, 14, top_txt, top_fg, bg="#09111E", border="#1E293B", anchor="w", font=("DejaVu Sans", 8, "bold"))
 
@@ -3270,7 +3992,7 @@ class DashboardApp:
         c.create_rectangle(mx0, 36, mx1, 128, fill="#0B1324", outline="#1E293B", width=1)
         c.create_text(mx0 + 12, 50, text="ISS LIVE TELEMETRY", fill="#38BDF8", font=("DejaVu Sans", 9, "bold"), anchor="w")
         if live:
-            st_lbl = "OVERHEAD LOCAL NOW" if st["is_live_overhead"] else f"{live['dist_km']:,} km {live['compass']} of Chennai"
+            st_lbl = "OVERHEAD HOME NOW" if st["is_live_overhead"] else f"{live['dist_km']:,} km {live['compass']} of Home"
             st_col = "#FCA5A5" if st["is_live_overhead"] else "#F8FAFC"
             c.create_text(mx0 + 12, 72, text=safe_tcl(st_lbl), fill=st_col, font=("DejaVu Sans", 12, "bold"), anchor="w")
             sub1 = f"Elev {live['el_deg']:.0f}\u00b0  \u2022  Az {live['az_deg']:.0f}\u00b0  \u2022  {live['alt_km']} km alt"
@@ -3310,7 +4032,7 @@ class DashboardApp:
         else:
             c.create_text(mx0 + 12, 286, text="Loading upcoming ISRO launches...", fill="#94A3B8", font=("DejaVu Sans", 8), anchor="w")
 
-        # Column 3 (x=706..1012): Next 3 Visible ISS Passes over Chennai
+        # Column 3 (x=706..1012): Next 3 Visible ISS Passes over Home
         rx0, rx1 = 706, mw - 12
         c.create_text(rx0 + 2, 42, text="VISIBLE ISS PASSES (MAX >= 25\u00b0)", fill="#FBBF24", font=("DejaVu Sans", 9, "bold"), anchor="w")
         cy_card = 56
@@ -3336,7 +4058,7 @@ class DashboardApp:
                 cy_card = y1 + 8
         else:
             c.create_rectangle(rx0, cy_card, rx1, cy_card + 130, fill="#0B1324", outline="#1E293B", width=1)
-            msg_none = "No dark-sky visible passes (next 21d)\nOrbits cross Chennai in daylight or shadow."
+            msg_none = "No dark-sky visible passes (next 21d)\nOrbits cross Home in daylight or shadow."
             c.create_text(rx0 + 12, cy_card + 36, text=safe_tcl(msg_none), fill="#CBD5E1", font=("DejaVu Sans", 9), anchor="w")
             nx = st.get("next_shadow")
             if nx:
@@ -3396,7 +4118,7 @@ class DashboardApp:
             self.lbl_map_dst.place_forget()
             self.flight_prog_canvas.place_forget()
             brng_lbl = f"Heading {fl['track']}\u00b0 ({_compass_dir(fl['track'])})" if fl.get("track") is not None else "Live Track"
-            rt_txt = f"Crossing Chennai 10 km Zone (Home Base)  \u2022  {brng_lbl}"
+            rt_txt = f"Crossing Chennai 10 km Zone  \u2022  {brng_lbl}"
             self.lbl_flight_route.config(text=safe_tcl(rt_txt), fg=self.theme["accent"])
             self.lbl_flight_route.place(x=14, y=34)
 
@@ -3410,12 +4132,12 @@ class DashboardApp:
             parts.append(f"Squawk: {fl['squawk']}")
         if fl.get("reg"):
             parts.append(f"Reg: {fl['reg']}")
-        parts.append("Chennai 10 km Radar")
+        parts.append("Local 10 km Radar")
         self.lbl_flight_meta.config(text=safe_tcl("  \u2022  ".join(parts)))
 
     def _update_flight_clear_hud(self, last_fl):
         self.lbl_flight_badge.config(text=safe_tcl("\u2708 10 KM RADAR"), bg="#0284C7")
-        self.lbl_flight_title.config(text=safe_tcl("Chennai / Chennai Airspace Clear (0 within 10 km)"))
+        self.lbl_flight_title.config(text=safe_tcl("Chennai Airspace Clear (0 within 10 km)"))
         self.lbl_flight_dist.config(text=safe_tcl("Auto-Popup: Active (10 km)"))
 
         self.lbl_map_orig.place_forget()
@@ -3444,7 +4166,7 @@ class DashboardApp:
         else:
             self.lbl_flight_route.config(text=safe_tcl("Scanning 10 km radius around Chennai (13.0827\u00b0N, 80.2707\u00b0E) every 15s"), fg=self.theme["accent"])
             self.lbl_flight_route.place(x=14, y=34)
-            self.lbl_flight_meta.config(text=safe_tcl("Automatically switches to full-screen live track whenever any aircraft enters 10 km of Chennai"))
+            self.lbl_flight_meta.config(text=safe_tcl("Automatically switches to full-screen live track whenever any aircraft enters 10 km of Home"))
 
     def _request_map_tiles(self, tile_key, zoom, vx0, vy0, mw, mh):
         if self._map_loading_key == tile_key:
@@ -3586,7 +4308,7 @@ class DashboardApp:
                 pcol = "#EF4444" if phase < 0.4 else ("#B91C1C" if phase < 0.72 else "#1E3A5F")
                 c.create_oval(hx - pr, hy - pr, hx + pr, hy + pr, outline=pcol, width=2 if phase < 0.45 else 1)
             c.create_polygon(hx, hy - 6, hx + 6, hy, hx, hy + 6, hx - 6, hy, fill="#EF4444", outline="#FEF08A", width=1.5)
-            self._draw_pill_label(c, hx, hy + 20, "HOME RADAR BASE", "#FCA5A5", bg="#1E1016", border="#991B1B")
+            self._draw_pill_label(c, hx, hy + 20, "HOME RADAR", "#FCA5A5", bg="#1E1016", border="#991B1B")
 
             # Info card bottom-left on Canvas
             last_fl = getattr(self, "_last_flight_seen_ui", None)
@@ -3596,18 +4318,18 @@ class DashboardApp:
                 code = last_fl.get("iata") or last_fl["callsign"]
                 ago_s = max(0, int(time.time() - last_fl.get("seen_at", time.time())))
                 ago_txt = f"{ago_s}s ago" if ago_s < 60 else (f"{ago_s // 60}m ago" if ago_s < 3600 else f"{ago_s // 3600}h {(ago_s % 3600) // 60}m ago")
-                c.create_text(bx0 + 12, by0 + 14, text="LAST 10 KM LOCAL CROSSING", fill="#FBBF24", font=("DejaVu Sans", 8, "bold"), anchor="w")
+                c.create_text(bx0 + 12, by0 + 14, text="LAST 10 KM HOME CROSSING", fill="#FBBF24", font=("DejaVu Sans", 8, "bold"), anchor="w")
                 rt_str = f"  ({last_fl['orig_code']} \u2192 {last_fl['dst_code']})" if (last_fl.get("route_valid") and last_fl.get("orig_code") and last_fl.get("dst_code")) else ""
                 c.create_text(bx0 + 12, by0 + 36, text=safe_tcl(f"{code}{rt_str}  \u2022  {ago_txt}"), fill="#F8FAFC", font=("DejaVu Sans", 10, "bold"), anchor="w")
                 c.create_text(bx0 + 12, by0 + 57, text=safe_tcl(f"{last_fl.get('aircraft', 'Aircraft')}  \u2022  {last_fl['dist_km']} km {last_fl.get('compass', '')}"), fill="#CBD5E1", font=("DejaVu Sans", 8), anchor="w")
                 c.create_text(bx0 + 12, by0 + 77, text=safe_tcl(f"Alt: {last_fl['alt_ft']:,} ft  \u2022  Speed: {last_fl.get('speed_kmh', '--')} km/h"), fill="#38BDF8", font=("DejaVu Sans", 8, "bold"), anchor="w")
             else:
-                c.create_text(bx0 + 12, by0 + 14, text="LOCAL 10 KM RADAR ACTIVE", fill="#38BDF8", font=("DejaVu Sans", 8, "bold"), anchor="w")
+                c.create_text(bx0 + 12, by0 + 14, text="HOME 10 KM RADAR ACTIVE", fill="#38BDF8", font=("DejaVu Sans", 8, "bold"), anchor="w")
                 c.create_text(bx0 + 12, by0 + 38, text="Monitoring 10 km circle around Chennai", fill="#F8FAFC", font=("DejaVu Sans", 9, "bold"), anchor="w")
-                c.create_text(bx0 + 12, by0 + 59, text="Center: 13.0827\u00b0N, 80.2707\u00b0E (Home Base)", fill="#CBD5E1", font=("DejaVu Sans", 8), anchor="w")
+                c.create_text(bx0 + 12, by0 + 59, text="Center: 13.0827\u00b0N, 80.2707\u00b0E", fill="#CBD5E1", font=("DejaVu Sans", 8), anchor="w")
                 c.create_text(bx0 + 12, by0 + 78, text="Full-screen popup activates on crossing", fill="#34D399", font=("DejaVu Sans", 8, "bold"), anchor="w")
 
-            self._draw_pill_label(c, 12, 16, "\u25cf 10 KM LOCAL RADAR  \u2022  CLEAR", "#7DD3FC", bg="#09111E", border="#1E293B", anchor="w")
+            self._draw_pill_label(c, 12, 16, "\u25cf 10 KM HOME RADAR  \u2022  CLEAR", "#7DD3FC", bg="#09111E", border="#1E293B", anchor="w")
         else:
             ax, ay = to_xy(ac_lat, ac_lon)
             if has_route:
@@ -3670,7 +4392,7 @@ class DashboardApp:
             c.create_polygon(hx, hy - 6, hx + 6, hy, hx, hy + 6, hx - 6, hy, fill="#EF4444", outline="#FEF08A", width=1.5)
             hx_c = max(84, min(mw - 84, hx))
             hy_off = 18 if hy < mh - 36 else -18
-            self._draw_pill_label(c, hx_c, hy + hy_off, "HOME BASE", "#FCA5A5", bg="#1E1016", border="#991B1B")
+            self._draw_pill_label(c, hx_c, hy + hy_off, "HOME", "#FCA5A5", bg="#1E1016", border="#991B1B")
 
             halo_r = 14 + (frame % 10) * 0.9
             c.create_oval(ax - halo_r, ay - halo_r, ax + halo_r, ay + halo_r, outline="#38BDF8", width=1)
@@ -3694,7 +4416,7 @@ class DashboardApp:
             tag_y = ay - 22 if ay > 48 else ay + 24
             self._draw_pill_label(c, tag_x, tag_y, tag_txt, "#FFFFFF", bg="#0F172A", border="#38BDF8")
 
-            self._draw_pill_label(c, 12, 16, "\u25cf LIVE OVERHEAD LOCAL (<= 10 KM)", "#FCA5A5", bg="#09111E", border="#991B1B", anchor="w")
+            self._draw_pill_label(c, 12, 16, "\u25cf LIVE OVERHEAD HOME (<= 10 KM)", "#FCA5A5", bg="#09111E", border="#991B1B", anchor="w")
 
         tog_id = c.create_text(mw - 14, 16, text=safe_tcl("[M] Back to Main"), fill="#94A3B8", font=("DejaVu Sans", 8, "bold"), anchor="e")
         tb = c.bbox(tog_id)
@@ -3718,60 +4440,92 @@ class DashboardApp:
         disk_col = "#EF4444" if disk_p > 90 else ("#F59E0B" if disk_p > 80 else self.theme["fg"])
 
         self.lbl_sys_cpu.config(text=f"{cpu_p}%", fg=cpu_col)
-        self.lbl_sys_temp.config(text=f"Temp: {cpu_t}Â°C", fg=cpu_col)
+        self.lbl_sys_temp.config(text=safe_tcl(f"Temp: {cpu_t}\u00b0C  \u2022  Load: {s.get('load_avg', '--')}"), fg=cpu_col)
 
         self.lbl_sys_ram.config(text=f"{ram_p}%", fg=ram_col)
         self.lbl_sys_ram_sub.config(text=f"{s['ram_used_mb']} MB used / {s['ram_total_mb']} MB")
 
         self.lbl_sys_disk.config(text=f"{disk_p}%", fg=disk_col)
-        self.lbl_sys_disk_sub.config(text=f"{s['disk_free_gb']} GB Free")
+        self.lbl_sys_disk_sub.config(text=f"{s['disk_free_gb']} GB Free on /")
+        usb_txt = s.get("usb_status", "USB: Not mounted")
+        self.lbl_sys_usb.config(
+            text=safe_tcl(usb_txt),
+            fg="#10B981" if "free" in usb_txt else self.theme["fg_sub"]
+        )
 
         self.lbl_sys_net.config(text=f"Internet: {s['inet_ping']}", fg="#10B981" if "ms" in s["inet_ping"] else "#EF4444")
-        self.lbl_sys_net_sub.config(text=f"Router: {s['router_ping']}")
+        self.lbl_sys_net_sub.config(text=safe_tcl(f"Router: {s['router_ping']}  \u2022  {s.get('lan_ip', '--')}"))
+        rx_s = _format_rate(s.get("net_rx_kbs", 0.0))
+        tx_s = _format_rate(s.get("net_tx_kbs", 0.0))
+        self.lbl_sys_bw.config(text=safe_tcl(f"\u2193 {rx_s}   \u2191 {tx_s}"))
 
-        self.lbl_sys_ts.config(text=f"Tailscale: {s['tailscale_status']}", fg="#10B981" if s["tailscale_status"] == "Connected" else self.theme["fg_sub"])
-        self.lbl_sys_docker.config(text=f"Docker Containers: {s['docker_count']}")
+        svcs = s.get("services") or {}
+        for lbl, chip in self.svc_chip_labels.items():
+            ok = bool(svcs.get(lbl, False))
+            chip.config(fg="#10B981" if ok else "#EF4444")
+
         ads_b = s.get("ads_blocked", "--")
         ads_p = s.get("ads_percent", "--")
         dns_q = s.get("dns_queries", "--")
         self.lbl_sys_adguard.config(text=safe_tcl(f"Ads Blocked: {ads_b} / {dns_q} ({ads_p})"))
 
+        sec_armed = bool(s.get("security_armed", False))
+        sec_cnt = int(s.get("security_events", 0))
+        sec_last = s.get("security_last", "")
+        if sec_armed:
+            sec_txt = f"Sec: ARMED ({sec_cnt} ev)"
+            sec_col = "#EF4444"
+        else:
+            last_hm = sec_last.split()[-1] if sec_last else ""
+            tail = f" \u2022 last {last_hm}" if last_hm else ""
+            sec_txt = f"Sec: Standby ({sec_cnt} ev{tail})"
+            sec_col = "#94A3B8"
+        self.lbl_sys_sec.config(text=safe_tcl(sec_txt), fg=sec_col)
+
         self.lbl_sys_pwr.config(text=f"Power: {s['battery_status']}")
         self.lbl_sys_uptime.config(text=f"Uptime: {s['uptime_str']}")
+        self.lbl_sys_ts.config(
+            text=f"Tailscale: {s['tailscale_status']}",
+            fg="#10B981" if s["tailscale_status"] == "Connected" else self.theme["fg_sub"]
+        )
 
         if STATE.active_page == 2:
-            self.draw_sparklines(s["cpu_history"], s["ram_history"])
+            self.draw_sparklines(s["cpu_history"], s["ram_history"], s.get("net_history"))
 
-    def draw_sparklines(self, cpu_hist, ram_hist):
+    def draw_sparklines(self, cpu_hist, ram_hist, net_hist=None):
         c = self.sys_sparkline
         c.delete("all")
         w = c.winfo_width() or (self.screen_w - 60)
         h = c.winfo_height() or 110
 
-        pad_x = 20
-        pad_y = 15
-        cw = w - 2 * pad_x
-        ch = h - 2 * pad_y
+        pad_l = 36
+        pad_r = 16
+        pad_y = 12
+        cw = max(40, w - pad_l - pad_r)
+        ch = max(30, h - 2 * pad_y)
         n = len(cpu_hist)
-        if n < 2: return
-        step_x = cw / (n - 1)
+        if n < 2:
+            return
+        step_x = cw / float(n - 1)
 
-        c.create_line(pad_x, pad_y + ch, pad_x + cw, pad_y + ch, fill="#334155", width=1)
-        c.create_line(pad_x, pad_y, pad_x + cw, pad_y, fill="#334155", width=1, dash=(2, 2))
+        for pct_g, lbl_g in ((100, "100%"), (50, "50%"), (0, "0%")):
+            gy = pad_y + ch - (pct_g / 100.0) * ch
+            c.create_line(pad_l, gy, pad_l + cw, gy, fill="#334155", width=1, dash=(2, 3) if pct_g else None)
+            c.create_text(pad_l - 6, gy, text=lbl_g, fill="#64748B", font=("DejaVu Sans", 7), anchor="e")
 
-        c_pts = []
-        for i, val in enumerate(cpu_hist):
-            x = pad_x + i * step_x
-            y = pad_y + ch - (val / 100.0) * ch
-            c_pts.extend([x, y])
-        c.create_line(c_pts, fill="#06B6D4", width=2, smooth=True)
+        def _plot(series, color, width=2):
+            pts = []
+            for i, val in enumerate(series):
+                x = pad_l + i * step_x
+                y = pad_y + ch - (max(0.0, min(100.0, float(val))) / 100.0) * ch
+                pts.extend([x, y])
+            if len(pts) >= 4:
+                c.create_line(pts, fill=color, width=width, smooth=True)
 
-        r_pts = []
-        for i, val in enumerate(ram_hist):
-            x = pad_x + i * step_x
-            y = pad_y + ch - (val / 100.0) * ch
-            r_pts.extend([x, y])
-        c.create_line(r_pts, fill="#10B981", width=2, smooth=True)
+        if net_hist and len(net_hist) == n:
+            _plot(net_hist, "#F59E0B", width=1.8)
+        _plot(ram_hist, "#10B981", width=2.2)
+        _plot(cpu_hist, "#06B6D4", width=2.2)
 
     def update_slideshow(self):
         skip = False
@@ -3818,8 +4572,15 @@ class DashboardApp:
                     self.slideshow_canvas.image = tk_img
                     self.last_photo_path = target_img_path
 
-                    cap_text = os.path.basename(target_img_path) if is_local else "Random Photo"
+                    cap_text = os.path.basename(target_img_path) if is_local else "Bing Daily / Gallery"
                     self.slideshow_canvas.itemconfig(self.photo_caption_id, text=safe_tcl(cap_text))
+                    bbox = self.slideshow_canvas.bbox(self.photo_caption_id)
+                    if bbox:
+                        self.slideshow_canvas.coords(
+                            self.photo_caption_bg_id,
+                            bbox[0] - 8, bbox[1] - 4, bbox[2] + 8, bbox[3] + 4
+                        )
+                    self.slideshow_canvas.lift(self.photo_caption_bg_id)
                     self.slideshow_canvas.lift(self.photo_caption_id)
 
                 except Exception as e:
@@ -4076,26 +4837,55 @@ class DashboardApp:
         self.sidebar_frame.place(x=self.burn_shift_x, y=self.burn_shift_y)
         self.root.after(300000, self.update_burn_in_protection)
 
-    def update_theme_and_brightness(self):
+    def _on_dot_click(self, page_idx):
+        self.last_page_change = time.time()
+        self._flight_auto_active = False
+        if page_idx == 5:
+            self.flight_map_dismissed_hexes.clear()
+        self.set_page(page_idx)
+
+    def cycle_theme(self):
+        order = ["day", "evening", "night", "oled"]
+        cur = self.current_theme_name if self.current_theme_name in order else "day"
+        nxt = order[(order.index(cur) + 1) % len(order)]
+        CONFIG["theme"] = nxt
+        STATE.night_mode_active = (nxt == "night")
+        self.apply_theme(nxt)
+
+    def _apply_auto_theme_now(self):
         hour = datetime.datetime.now().hour
         n_cfg = CONFIG.get("night_mode", {})
         n_start = n_cfg.get("start_hour", 23)
         n_end = n_cfg.get("end_hour", 6)
-
         is_night_time = (hour >= n_start or hour < n_end)
+        if is_night_time and n_cfg.get("enabled", True):
+            self.apply_theme("night")
+            set_screen_brightness(n_cfg.get("brightness_night", 0.5))
+        elif 17 <= hour < n_start:
+            self.apply_theme("evening")
+            set_screen_brightness(n_cfg.get("brightness_evening", 0.85))
+        else:
+            self.apply_theme("day")
+            set_screen_brightness(n_cfg.get("brightness_day", 1.0))
 
-        if not STATE.night_mode_active:
-            if is_night_time and n_cfg.get("enabled", True):
-                self.apply_theme("night")
-                set_screen_brightness(n_cfg.get("brightness_night", 0.5))
-            elif 17 <= hour < n_start:
-                self.apply_theme("evening")
-                set_screen_brightness(n_cfg.get("brightness_evening", 0.85))
-            else:
-                self.apply_theme("day")
-                set_screen_brightness(n_cfg.get("brightness_day", 1.0))
-
+    def update_theme_and_brightness(self):
+        pref = str(CONFIG.get("theme", "auto")).lower()
+        if pref in ("day", "evening", "night", "oled"):
+            self.apply_theme(pref)
+        elif not STATE.night_mode_active:
+            self._apply_auto_theme_now()
         self.root.after(600000, self.update_theme_and_brightness)
+
+    def _retheme_descendants(self, widget, card_bg):
+        for child in widget.winfo_children():
+            if child in (getattr(self, "lbl_event_badge", None),):
+                continue
+            try:
+                child.config(bg=card_bg)
+            except Exception:
+                pass
+            if isinstance(child, tk.Frame):
+                self._retheme_descendants(child, card_bg)
 
     def apply_theme(self, theme_name):
         self.current_theme_name = theme_name
@@ -4115,11 +4905,19 @@ class DashboardApp:
         self.page_system.config(bg=bg)
         self.page_money.config(bg=bg)
 
-        for c in [self.card_clock, self.card_weather, self.card_event]:
-            c.config(bg=card_bg, highlightbackground=card_border)
-            for w in c.winfo_children():
-                try: w.config(bg=card_bg)
-                except: pass
+        all_cards = [self.card_clock, self.card_weather, self.card_event] + list(self._themed_cards)
+        for c in all_cards:
+            try:
+                c.config(bg=card_bg, highlightbackground=card_border)
+                self._retheme_descendants(c, card_bg)
+            except Exception:
+                pass
+
+        for t_lbl in self._themed_titles:
+            try:
+                t_lbl.config(fg=accent, bg=card_bg)
+            except Exception:
+                pass
 
         self.lbl_time.config(fg=fg)
         self.lbl_ampm.config(fg=accent)
@@ -4134,6 +4932,27 @@ class DashboardApp:
         self.lbl_event_title.config(fg=fg)
         self.lbl_event_sub.config(fg=fg_sub)
 
+        for lbl_d, lbl_t in getattr(self, "daily_labels", []):
+            lbl_d.config(fg=fg)
+            lbl_t.config(fg=accent)
+        for lbl_w in (self.lbl_p2_uv_aqi, self.lbl_p2_sun, self.lbl_rate_usd, self.lbl_rate_eur, self.lbl_rate_gbp, self.lbl_day_of_year, self.lbl_week_num, self.lbl_quote_text, self.lbl_sys_pwr):
+            try:
+                lbl_w.config(fg=fg)
+            except Exception:
+                pass
+        for lbl_s in (self.lbl_p2_wind_hum, self.lbl_rate_sub, self.lbl_sys_ram_sub, self.lbl_sys_disk_sub, self.lbl_sys_net_sub, self.lbl_sys_uptime):
+            try:
+                lbl_s.config(fg=fg_sub)
+            except Exception:
+                pass
+        for lbl_a in (self.lbl_p2_moon, self.lbl_moon_info, self.lbl_quote_author):
+            try:
+                lbl_a.config(fg=accent)
+            except Exception:
+                pass
+
+        self.hourly_canvas.config(bg=card_bg)
+        self.sys_sparkline.config(bg=card_bg)
         self.flight_hud_accent.config(bg=accent)
         self.sky_hud_accent.config(bg=accent)
         if not getattr(self, "_active_map_flight", None) or not self._active_map_flight.get("route_valid"):
@@ -4172,7 +4991,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     os.environ["DISPLAY"] = ":0"
-    log_msg("Starting newdash26 dashboard application")
+    log_msg(f"Starting newdash v{DASHBOARD_VERSION} dashboard application")
 
     root = tk.Tk()
     app = DashboardApp(root)
